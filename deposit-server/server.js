@@ -21,6 +21,9 @@ const cfg = {
   siteUrl: (E.SITE_URL || '').replace(/\/$/, ''),                                 // where players land after Steam login, e.g. https://crystaldrop.gg
   steamKey: E.STEAM_API_KEY || '',                                              // optional: lets us show the Steam profile name
   sessionDays: +E.SESSION_DAYS || 30,
+  skins: E.SKIN_PROVIDER || ((E.PROVIDER || (E.NOWPAYMENTS_API_KEY ? 'nowpayments' : 'mock')) === 'mock' ? 'mock' : 'off'),   // CS2 skin deposits: 'mock' (demo trades) | 'off' (until real trade bots are connected)
+  skinRate: Math.min(1, Math.max(0.5, +E.SKIN_RATE || 0.9)),                    // CR credited per $1 of skin market value
+  skinTtlMin: +E.SKIN_TTL_MIN || 15, skinMaxItems: +E.SKIN_MAX_ITEMS || 30, skinBot: E.SKIN_BOT_NAME || 'CrystalDropBot',
   email: { provider: E.EMAIL_PROVIDER || (E.RESEND_API_KEY ? 'resend' : 'console'), resendKey: E.RESEND_API_KEY || '', from: E.EMAIL_FROM || 'CrystalDrop <no-reply@example.com>' },
 };
 // coin + network (as the page sends them) -> NOWPayments pay_currency code. Verify against GET /v1/currencies for your account.
@@ -56,7 +59,24 @@ const q = {
   ev: db.prepare('INSERT INTO events (at,deposit_id,note) VALUES (?,?,?)'),
 };
 try { db.exec('ALTER TABLE users ADD COLUMN referred_by TEXT'); } catch (e) {}
-try { db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0'); } catch (e) {}      // older databases
+try { db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0'); } catch (e) {}
+try { db.exec('ALTER TABLE deposits ADD COLUMN items TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE deposits ADD COLUMN trade_url TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN name_set INTEGER DEFAULT 1'); } catch (e) {}      // 0 = Steam player still has to choose a name
+const NAME_RE = /^[A-Za-z0-9]{3,15}$/;                                                          // display names: 3 to 15 letters and numbers only
+const TRADE_URL = /^https:\/\/steamcommunity\.com\/tradeoffer\/new\/\?partner=\d{1,10}&token=[A-Za-z0-9_-]{8}$/;
+const NAME_MSG = 'username must be 3 to 15 letters or numbers (no spaces, symbols or emojis)';
+const nameBad = (() => { const sq = s => s.replace(/(.)\1+/g, '$1');
+  const SUB = 'fuck shit bitch cunt pussy whore slut bastard nigger nigga faggot retard rapist hitler nazi penis vagina asshole wank twat porn molest pedophil paedophil jizz blowjob handjob dildo cumshot chink tranny dick boob killyourself motherfuck bukkake anus'.split(' ').map(sq);
+  const EXACT = 'cock ass arse anal tit tits sex rape coon kkk cum spic gook dyke fag fags nig kike pedo kys hoe'.split(' ').map(sq);
+  const RES_SUB = 'crystaldrop admin moderator official'.split(' ').map(sq), RES_EXACT = 'support staff owner system mod security helpdesk dev'.split(' ').map(sq);
+  return n => { const low = n.toLowerCase(), outs = new Set();
+    for (const one of ['i', 'l']) { const t = low.replace(/0/g, 'o').replace(/1/g, one).replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't').replace(/8/g, 'b').replace(/9/g, 'g'); outs.add(sq(t)); }
+    for (const t of outs) { const bare = t.replace(/[0-9]/g, '');
+      if (SUB.some(w => t.includes(w)) || RES_SUB.some(w => t.includes(w))) return true;
+      if (EXACT.some(w => bare === w) || RES_EXACT.some(w => bare === w)) return true; }
+    return false; }; })();
+const NAME_BAD_MSG = 'that username is not allowed, please choose another';      // older databases
 const log = (id, note) => { q.ev.run(Date.now(), id, String(note).slice(0, 300)); };
 
 // Credit exactly once: ledger.ref is UNIQUE, so a replayed webhook can't double-pay. Both statements run in one transaction.
@@ -85,7 +105,7 @@ const U = {
   clean: db.prepare('DELETE FROM sessions WHERE expires_at<?'),
 };
 const newUserId = () => 'CR-' + crypto.randomBytes(5).toString('hex').toUpperCase();
-const pubUser = u => ({ id: u.id, name: u.name, email: u.email || null, steam: !!u.steam_id, verified: !!(u.email_verified || u.steam_id) });
+const pubUser = u => ({ id: u.id, name: u.name, email: u.email || null, steam: !!u.steam_id, verified: !!(u.email_verified || u.steam_id), needsName: u.name_set === 0 || !NAME_RE.test(u.name || '') || nameBad(u.name || '') });
 // ---- email (verification + password reset) ----
 const outbox = [];                                                                 // 'console' provider keeps the last messages here (used by tests / local dev)
 async function sendMail(to, subject, text) {
@@ -203,7 +223,8 @@ const server = http.createServer(async (req, res) => {
       const email = String(b.email || '').trim().toLowerCase(), pw = String(b.password || '');
       if (!EMAIL.test(email)) return send(res, 400, { error: 'enter a valid email address' });
       if (pw.length < 8 || pw.length > 200) return send(res, 400, { error: 'password must be at least 8 characters' });
-      const name = String(b.name || '').trim(); if (name.length < 2 || name.length > 24) return send(res, 400, { error: 'display name must be 2 to 24 characters' });
+      const name = String(b.name || '').trim(); if (!NAME_RE.test(name)) return send(res, 400, { error: NAME_MSG });
+      if (nameBad(name)) return send(res, 400, { error: NAME_BAD_MSG });
       if (db.prepare('SELECT 1 FROM users WHERE name = ? COLLATE NOCASE').get(name)) return send(res, 409, { error: 'that display name is taken' });
       if (b.adult !== true) return send(res, 400, { error: 'you must confirm you are 18 or older' });
       if (U.byEmail.get(email)) return send(res, 409, { error: 'that email is already registered' });
@@ -263,9 +284,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/auth/profile') {
       const u = authUser(req); if (!u) return send(res, 401, { error: 'not signed in' }); let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
-      const name = String(b.name || '').trim().slice(0, 24); if (name.length < 2) return send(res, 400, { error: 'name must be at least 2 characters' });
+      const name = String(b.name || '').trim(); if (!NAME_RE.test(name)) return send(res, 400, { error: NAME_MSG });
+      if (nameBad(name)) return send(res, 400, { error: NAME_BAD_MSG });
       if (db.prepare('SELECT 1 FROM users WHERE name = ? COLLATE NOCASE AND id != ?').get(name, u.id)) return send(res, 409, { error: 'that display name is taken' });
-      db.prepare('UPDATE users SET name=? WHERE id=?').run(name, u.id); return send(res, 200, { user: pubUser(U.byId.get(u.id)) });
+      db.prepare('UPDATE users SET name=?, name_set=1 WHERE id=?').run(name, u.id); return send(res, 200, { user: pubUser(U.byId.get(u.id)) });
     }
     if (req.method === 'GET' && url.pathname === '/auth/me') { const u = authUser(req); return u ? send(res, 200, { user: pubUser(u) }) : send(res, 401, { error: 'not signed in' }); }
     if (req.method === 'POST' && url.pathname === '/auth/logout') { const m = /^Bearer (\w{64})$/.exec(req.headers.authorization || ''); if (m) U.delSess.run(sha(m[1])); return send(res, 200, { ok: true }); }
@@ -291,9 +313,10 @@ const server = http.createServer(async (req, res) => {
       let valid = false; try { valid = await steamVerify(params); } catch (e) {}
       if (!valid) return fail('Steam could not verify the login');
       let u = U.bySteam.get(m2[1]);
-      if (!u) { let name = 'Steam user ' + m2[1].slice(-4);
-        if (cfg.steamKey) { try { const j = await (await fetch('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=' + cfg.steamKey + '&steamids=' + m2[1])).json(); name = (j.response.players[0].personaname || name).slice(0, 24); } catch (e) {} }
-        const id = newUserId(); U.ins.run(id, null, null, null, m2[1], name, Date.now()); u = U.byId.get(id); }
+      if (!u) { let name = 'Player' + m2[1].slice(-4);
+        if (cfg.steamKey) { try { const j = await (await fetch('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=' + cfg.steamKey + '&steamids=' + m2[1])).json(); const pn = String(j.response.players[0].personaname || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 15); if (pn.length >= 3 && !nameBad(pn) && !db.prepare('SELECT 1 FROM users WHERE name = ? COLLATE NOCASE').get(pn)) name = pn; } catch (e) {} }
+        if (db.prepare('SELECT 1 FROM users WHERE name = ? COLLATE NOCASE').get(name)) name = 'Player' + crypto.randomBytes(4).toString('hex');
+        const id = newUserId(); U.ins.run(id, null, null, null, m2[1], name, Date.now()); db.prepare('UPDATE users SET name_set=0 WHERE id=?').run(id); u = U.byId.get(id); }
       const code = crypto.randomBytes(24).toString('hex'); U.code.run(sha(code), u.id, Date.now() + 60000);
       res.writeHead(302, { Location: back + '/#steam=' + code }); return res.end();
     }
@@ -313,6 +336,30 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { id: d.id, address: p.address, memo: p.memo, cryptoAmount: p.cryptoAmount, cryptoAmt: p.cryptoAmount, rate: p.rate, expiresAt: new Date(exp).toISOString(), confirmationsRequired: coin.conf });
     }
     let m;
+    if (req.method === 'GET' && url.pathname === '/skin-deposits/config') return send(res, 200, { enabled: cfg.skins !== 'off', demo: cfg.skins === 'mock', rate: cfg.skinRate, maxItems: cfg.skinMaxItems, min: cfg.min, max: cfg.max, ttlMin: cfg.skinTtlMin, bot: cfg.skinBot });
+    if (req.method === 'POST' && url.pathname === '/skin-deposits') {                                       // CS2 skins -> CR. 'mock' = demo trades; real trade bots plug in behind this same route
+      if (!humanOk(req)) return send(res, 403, { error: 'verification required, reload the page' });
+      const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to deposit' });
+      if (!pubUser(au).verified) return send(res, 403, { error: 'confirm your email address first (check your inbox)' });
+      if (cfg.skins === 'off') return send(res, 503, { error: 'skin deposits are not available yet' });
+      if (limited(ip)) return send(res, 429, { error: 'too many requests' });
+      let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
+      const tu = String(b.tradeUrl || '').trim(); if (!TRADE_URL.test(tu)) return send(res, 400, { error: 'enter your Steam trade URL (https://steamcommunity.com/tradeoffer/new/?partner=...&token=...)' });
+      const its = Array.isArray(b.items) ? b.items : []; if (!its.length || its.length > cfg.skinMaxItems) return send(res, 400, { error: `choose 1 to ${cfg.skinMaxItems} skins` });
+      const items = []; let value = 0;
+      for (const it of its) { const name = String(it && it.name || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 120), price = +(it && it.price); if (name.length < 3 || !(price >= 0.03 && price <= cfg.max)) return send(res, 400, { error: 'invalid skin in the offer' }); items.push({ name, price: +price.toFixed(2), wear: String(it.wear || '').slice(0, 20) }); value += price; }
+      value = +value.toFixed(2); const credit = Math.floor(value * cfg.skinRate * 100) / 100;
+      if (!(credit >= cfg.min && credit <= cfg.max)) return send(res, 400, { error: `the offer must be worth between ${cfg.min} and ${cfg.max} CR after the ${Math.round(cfg.skinRate * 100)}% rate` });
+      const id = 'dep_' + crypto.randomBytes(8).toString('hex'), code = 'CD-' + Array.from(crypto.randomBytes(4), x => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[x % 31]).join(''), exp = Date.now() + cfg.skinTtlMin * 60000;
+      q.ins.run(id, au.id, 'CS2', 'Steam trade', credit, items.length, cfg.skinRate, code, '', 'skins', 'skin_' + crypto.randomBytes(6).toString('hex'), 'pending', 1, Date.now(), exp);
+      db.prepare('UPDATE deposits SET items=?, trade_url=? WHERE id=?').run(JSON.stringify(items), tu, id); log(id, 'skin offer ' + items.length + ' items, value ' + value + ', credit ' + credit);
+      return send(res, 200, { id, code, bot: cfg.skinBot, value, credit, rate: cfg.skinRate, count: items.length, expiresAt: new Date(exp).toISOString(), demo: cfg.skins === 'mock' });
+    }
+    if (cfg.skins === 'mock' && req.method === 'POST' && (m = url.pathname.match(/^\/skin-deposits\/([\w-]+)\/simulate$/))) {   // demo only: pretend the player accepted the trade
+      const au = authUser(req), d = q.get.get(m[1]); if (!au || !d || d.user_id !== au.id || d.coin !== 'CS2') return send(res, 404, { error: 'not found' });
+      if (d.status === 'pending' && d.expires_at < Date.now()) return send(res, 400, { error: 'this trade offer has expired' });
+      return send(res, 200, { status: applyStatus(d, 'finished', 'demotrade_' + crypto.randomBytes(4).toString('hex')) });
+    }
     if (req.method === 'GET' && (m = url.pathname.match(/^\/deposits\/([\w-]+)$/))) {
       const au = authUser(req), d = q.get.get(m[1]); if (!au || !d || d.user_id !== au.id) return send(res, 404, { error: 'not found' });
       if (d.status === 'pending' && d.expires_at < Date.now() - 6 * 3600e3) { q.upd.run('expired', d.confirmations, null, d.raw_status, d.id); d.status = 'expired'; }   // keep a grace period: late payments can still arrive
