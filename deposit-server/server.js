@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS login_codes (code_hash TEXT PRIMARY KEY, user_id TEXT
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, deposit_id TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, name TEXT, text TEXT NOT NULL, ts INTEGER);
 CREATE TABLE IF NOT EXISTS mutes (user_id TEXT PRIMARY KEY, until INTEGER);
+CREATE TABLE IF NOT EXISTS feed (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, name TEXT, game TEXT, stake REAL, mult REAL, payout REAL, ts INTEGER);
 CREATE TABLE IF NOT EXISTS tips (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL, from_name TEXT, amount REAL NOT NULL, ts INTEGER, claimed INTEGER DEFAULT 0);`);
 const q = {
   ins: db.prepare('INSERT INTO deposits (id,user_id,coin,network,amount_cr,crypto_amount,rate,address,memo,provider,provider_id,status,required,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'),
@@ -167,7 +168,7 @@ const server = http.createServer(async (req, res) => {
         const okc = !!(await r.json()).success; return send(res, 200, okc ? { ok: true, pass: humanPass() } : { ok: false }); } catch (e) { return send(res, 502, { ok: false, error: 'captcha service unreachable' }); }
     }
     // ---- live chat and tips ----  Chat: 5 second gap per user, 200 characters, no links, muted users blocked. Tips: whole accounts by display name, claimed by the receiver's page.
-    const lastMsg = (globalThis.__lastMsg = globalThis.__lastMsg || new Map()), lastTip = (globalThis.__lastTip = globalThis.__lastTip || new Map());
+    const lastMsg = (globalThis.__lastMsg = globalThis.__lastMsg || new Map()), lastTip = (globalThis.__lastTip = globalThis.__lastTip || new Map()), lastFeed = (globalThis.__lastFeed = globalThis.__lastFeed || new Map());
     const CHAT_GAP = +E.CHAT_GAP_MS || 5000, TIP_MIN = 1, TIP_MAX = +E.TIP_MAX || 1000, TIP_DAY = +E.TIP_DAY || 5000;
     const needVerified = (u, res) => { if (!pubUser(u).verified) { send(res, 403, { error: 'confirm your email address first' }); return false; } return true; };
     if (req.method === 'GET' && url.pathname === '/chat') {
@@ -214,6 +215,20 @@ const server = http.createServer(async (req, res) => {
       if (!cfg.adminToken || req.headers.authorization !== 'Bearer ' + cfg.adminToken) return send(res, 401, { error: 'unauthorized' }); let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       const t = db.prepare('SELECT id FROM users WHERE name = ? COLLATE NOCASE').get(String(b.name || '')); if (!t) return send(res, 404, { error: 'no such player' });
       db.prepare('INSERT OR REPLACE INTO mutes (user_id, until) VALUES (?,?)').run(t.id, Date.now() + Math.max(1, +b.minutes || 60) * 60000); return send(res, 200, { ok: true });
+    }
+    if (req.method === 'GET' && url.pathname === '/feed') {                                            // everyone's recent rounds, newest first (public)
+      return send(res, 200, { rounds: db.prepare('SELECT id, name, game, stake, mult, payout, ts FROM feed ORDER BY id DESC LIMIT 40').all() });
+    }
+    if (req.method === 'POST' && url.pathname === '/feed') {                                           // a signed-in player reports a finished round
+      const u = authUser(req); if (!u) return send(res, 401, { error: 'not signed in' });
+      let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
+      const game = String(b.game || '').trim(), stake = +b.stake, payout = +b.payout;
+      if (!/^[A-Za-z0-9 \-]{1,24}$/.test(game)) return send(res, 400, { error: 'bad game' });
+      if (!(stake >= 0.01) || stake > 10000 || !(payout >= 0) || payout > 50000) return send(res, 400, { error: 'bad amounts' });
+      const now = Date.now(); if (now - (lastFeed.get(u.id) || 0) < 300) return send(res, 429, { error: 'slow down' }); lastFeed.set(u.id, now);
+      const mult = Math.round(payout / stake * 100) / 100;
+      const r = db.prepare('INSERT INTO feed (user_id, name, game, stake, mult, payout, ts) VALUES (?,?,?,?,?,?,?)').run(u.id, u.name, game, Math.round(stake * 100) / 100, mult, Math.round(payout * 100) / 100, now);
+      db.prepare('DELETE FROM feed WHERE id <= ?').run(Number(r.lastInsertRowid) - 500); return send(res, 200, { ok: true });
     }
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, provider: cfg.provider });
     if (req.method === 'POST' && url.pathname === '/auth/signup') {
