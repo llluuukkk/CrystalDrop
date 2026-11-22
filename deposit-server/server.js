@@ -135,6 +135,17 @@ async function steamVerify(params) {                                            
 }
 
 // ---- providers ----
+const MINC = {};
+async function minCR(coin) {   // provider minimum in CR (1 CR = $1), +15% headroom for rate moves, cached 10 min
+  if (cfg.provider !== 'nowpayments') return cfg.min;
+  const c = MINC[coin.code]; if (c && Date.now() - c.at < 600000) return c.v;
+  let v = cfg.min;
+  try {
+    const r = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/min-amount?currency_from=' + coin.code + '&currency_to=' + coin.code + '&fiat_equivalent=usd&is_fixed_rate=True', { headers: { 'x-api-key': cfg.apiKey }, signal: AbortSignal.timeout(15000) });
+    const j = await r.json().catch(() => ({})); const m = +j.fiat_equivalent; if (r.ok && m > 0) v = Math.max(cfg.min, Math.ceil(m * 1.15 * 100) / 100);
+  } catch (e) { if (c) return c.v; }
+  MINC[coin.code] = { v, at: Date.now() }; return v;
+}
 const providers = {
   async nowpayments(d, coin) {
     const r = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/payment', { method: 'POST', signal: AbortSignal.timeout(35000), headers: { 'x-api-key': cfg.apiKey, 'Content-Type': 'application/json' },
@@ -331,6 +342,10 @@ const server = http.createServer(async (req, res) => {
         const id = newUserId(); U.ins.run(id, null, null, null, m2[1], name, Date.now()); db.prepare('UPDATE users SET name_set=0 WHERE id=?').run(id); u = U.byId.get(id); }
       const code = crypto.randomBytes(24).toString('hex'); U.code.run(sha(code), u.id, Date.now() + 60000);
       res.writeHead(302, { Location: back + '/#steam=' + code }); return res.end();
+    }
+    if (req.method === 'GET' && url.pathname === '/deposits/min') {       // smallest deposit the payment provider accepts for a coin
+      const coin = COINS[(url.searchParams.get('coin') || '') + '|' + (url.searchParams.get('network') || '')]; if (!coin) return send(res, 400, { error: 'unsupported coin/network' });
+      return send(res, 200, { minCR: await minCR(coin) });
     }
     if (req.method === 'POST' && url.pathname === '/deposits') {
       if (!humanOk(req)) return send(res, 403, { error: 'verification required, reload the page' });
