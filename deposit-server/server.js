@@ -137,7 +137,7 @@ async function steamVerify(params) {                                            
 // ---- providers ----
 const providers = {
   async nowpayments(d, coin) {
-    const r = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/payment', { method: 'POST', headers: { 'x-api-key': cfg.apiKey, 'Content-Type': 'application/json' },
+    const r = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/payment', { method: 'POST', signal: AbortSignal.timeout(35000), headers: { 'x-api-key': cfg.apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ price_amount: d.amount_cr, price_currency: 'usd', pay_currency: coin.code, order_id: d.id, order_description: 'CrystalDrop deposit', ipn_callback_url: cfg.publicUrl + '/webhook/nowpayments', is_fixed_rate: true }) });
     const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error('provider: ' + (j.message || r.status));
     return { providerId: String(j.payment_id), address: j.pay_address, memo: j.payin_extra_id || '', cryptoAmount: +j.pay_amount, rate: d.amount_cr / +j.pay_amount };
