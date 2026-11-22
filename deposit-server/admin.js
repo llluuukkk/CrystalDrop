@@ -2,7 +2,7 @@
 // Admin panel: GET /admin serves the page, POST /admin/api/* is the JSON API. Everything needs ADMIN_TOKEN (Bearer).
 const crypto = require('crypto');
 
-module.exports = function init({ db, cfg, send, readBody, PLAY, killSessions }) {
+module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions }) {
   db.exec(`CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, action TEXT, target TEXT, detail TEXT, ip TEXT);`);
   try { db.exec('ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
   try { db.exec('ALTER TABLE users ADD COLUMN ban_reason TEXT'); } catch (e) {}
@@ -93,9 +93,14 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, killSessions }) 
       return { status: PLAY.priceStatus(), total: items.length, moved, items: items.filter(x => !q || x.name.toLowerCase().includes(q)).slice(0, 60) };
     },
     async pricesRefresh(b, req) { await PLAY.refreshPrices(); audit(req, 'price refresh', '', ''); return { status: PLAY.priceStatus() }; },
+    sports(b) { return { status: SPORTS.admin.status(), summary: SPORTS.admin.summary(), events: SPORTS.admin.events(b.filter) }; },
+    async sportsSync(b, req) { await SPORTS.admin.sync(); audit(req, 'sports sync', '', ''); return { status: SPORTS.admin.status() }; },
+    sportsSettle(b, req) { const hs = Math.floor(+b.hs), as = Math.floor(+b.as); if (!(hs >= 0 && as >= 0 && hs < 100 && as < 100)) throw new Error('enter both scores'); const id = String(b.id || '');
+      return PLAY.tx(() => { SPORTS.admin.manual(id, 'settled', hs, as); const r = SPORTS.admin.resolve(id, 'settled', hs, as); audit(req, 'sports settle', id, hs + '-' + as + ' (' + r.bets + ' bets)'); return { ok: true, ...r }; }); },
+    sportsVoid(b, req) { const id = String(b.id || ''); return PLAY.tx(() => { SPORTS.admin.manual(id, 'cancelled', null, null); const r = SPORTS.admin.resolve(id, 'cancelled'); audit(req, 'sports void', id, r.bets + ' bets refunded'); return { ok: true, ...r }; }); },
     log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
   };
-  const ROUTES = { overview: API.overview, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, 'prices/refresh': API.pricesRefresh, log: API.log };
+  const ROUTES = { overview: API.overview, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
 
   async function route(req, res, url) {
     const P = url.pathname;
@@ -143,7 +148,7 @@ function signout(){TOKEN='';try{sessionStorage.removeItem('cd_admin')}catch(e){}
 $('#out').onclick=signout;
 $('#go').onclick=async()=>{TOKEN=$('#tok').value.trim();$('#lerr').textContent='';try{await api('overview');try{sessionStorage.setItem('cd_admin',TOKEN)}catch(e){}start()}catch(e){$('#lerr').textContent=e.message}};
 $('#tok').addEventListener('keydown',e=>{if(e.key==='Enter')$('#go').click()});
-const TABS=['Overview','Players','Rounds','Deposits','Chat','Prices','Log'];let tab='Overview';
+const TABS=['Overview','Players','Rounds','Deposits','Sports','Chat','Prices','Log'];let tab='Overview';
 function start(){$('#login').hidden=true;$('#app').hidden=false;const nav=$('#nav');nav.replaceChildren(...TABS.map(t=>E('button',{cls:t===tab?'on':'',on:{click:()=>{tab=t;start()}}},t)));VIEW[tab]().catch(e=>toast(e.message,1))}
 const tbl=(heads,rows,onrow)=>E('div',{cls:'wrap'},E('table',null,E('thead',null,E('tr',null,heads.map(h=>E('th',{cls:h.n?'n':''},h.t||h)))),E('tbody',null,rows.map(r=>{const tr=E('tr',onrow?{cls:'click',on:{click:()=>onrow(r)}}:null,r.cells.map((c,i)=>E('td',{cls:heads[i]&&heads[i].n?'n':''},c)));return tr}))));
 const K=(l,v,c)=>E('div',{cls:'k'},E('small',null,l),E('b',{cls:c||''},v));
@@ -162,6 +167,12 @@ async Rounds(){const u=E('input',{placeholder:'user id (optional)'}),g=E('input'
  run=async()=>{const r=await api('rounds',{user:u.value.trim(),game:g.value.trim(),minPayout:mp.value,limit:100});out.replaceChildren(E('h3',null,'Per game (all time)'),tbl(['Game',{t:'Rounds',n:1},{t:'Wagered',n:1},{t:'Paid',n:1},{t:'RTP %',n:1}],r.games.map(x=>({cells:[x.game,x.rounds,fmt(x.wagered),fmt(x.paid),x.rtp]}))),E('h3',{style:'margin-top:16px'},'Latest rounds'),tbl([{t:'#',n:1},'Player','Game',{t:'Stake',n:1},{t:'Payout',n:1},{t:'x',n:1},'Result','When'],r.rounds.map(x=>({id:x.uid,cells:[x.id,x.name,x.game,fmt(x.stake),fmt(x.payout),x.mult,x.label,dt(x.ts)]})),r=>PLAYER(r.id)))};
  show(E('div',{cls:'row'},u,g,mp,E('button',{cls:'b pri',on:{click:run}},'Filter')),out);await run()},
 async Deposits(){const s=E('select',null,['','finished','waiting','confirming','failed','expired'].map(x=>E('option',{value:x},x||'all statuses'))),out=E('div'),run=async()=>{const r=await api('deposits',{status:s.value,limit:100});out.replaceChildren(tbl(['Player','Coin',{t:'CR',n:1},'Status','Created','Credited'],r.deposits.map(d=>({id:d.user_id,cells:[d.name||d.user_id,d.coin+(d.network?' / '+d.network:''),fmt(d.amount_cr),d.status,dt(d.created_at),dt(d.credited_at)]})),r=>PLAYER(r.id)))};s.onchange=run;show(E('div',{cls:'row'},s),out);await run()},
+async Sports(){const filt=E('select',null,E('option',{value:''},'All matches'),E('option',{value:'open'},'With open bets'));filt.value=VIEW._sf||'';const out=E('div'),run=async()=>{VIEW._sf=filt.value;const r=await api('sports',{filter:filt.value}),s=r.status,m=r.summary;
+ out.replaceChildren(E('div',{cls:'grid'},K('Feed',s.mode,s.mode==='live'?'g':'y'),K('Last sync',s.last?dt(s.last):'never',s.last?'g':'y'),K('Matches stored',s.events),K('Last error',s.err||'none',s.err?'r':'g'),K('Odds-API key',s.keySet?'set':'NOT set',s.keySet?'g':'y'),K('Price cut',(s.cut*100).toFixed(1)+'%'),K('Live betting',s.liveBets?'ON':'off')),
+ E('div',{cls:'grid'},K('Open bets',m.openBets),K('Open stake (CR)',fmt(m.openStake)),K('Most you could pay',fmt(m.openPotential),'y'),K('Settled wagered',fmt(m.settledStake)),K('House result',fmt(m.house),m.house>=0?'g':'r')),
+ tbl(['Match','Sport','Start','Status',{t:'Open bets',n:1},{t:'Exposure',n:1},'Settle manually'],r.events.map(e=>{const h=E('input',{size:2,placeholder:'H',value:e.hs==null?'':e.hs}),a=E('input',{size:2,placeholder:'A',value:e.as==null?'':e.as});
+  return {cells:[e.home+' v '+e.away+(e.league?' ('+e.league+')':''),e.sport,dt(e.start),e.status+(e.manual?' (manual)':''),e.openLegs,fmt(e.exposure),E('span',{cls:'row',style:'margin:0'},h,a,E('button',{cls:'b pri',on:{click:async()=>{try{const x=await api('sports/settle',{id:e.id,hs:h.value,as:a.value});toast('Settled, '+x.bets+' bets resolved');run()}catch(z){toast(z.message,1)}}}},'Settle'),E('button',{cls:'b red',on:{click:async()=>{try{const x=await api('sports/void',{id:e.id});toast('Voided, '+x.bets+' bets refunded');run()}catch(z){toast(z.message,1)}}}},'Void'))]}})))};
+ filt.onchange=run;show(E('div',{cls:'row'},filt,E('button',{cls:'b pri',on:{click:async e=>{e.target.disabled=true;try{await api('sports/sync');toast('Synced')}catch(x){toast(x.message,1)}e.target.disabled=false;run()}}},'Sync now'),E('span',{cls:'m'},'Settle uses the final score (90 minutes for soccer, maps won for CS2). Void refunds every open bet on the match.')),out);await run()},
 async Chat(){const r=await api('chat',{limit:100});show(tbl(['Player','Message','When',''],r.chat.map(m=>({cells:[m.name,m.text,dt(m.ts),E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();await api('chat/delete',{id:m.id});toast('Deleted');VIEW.Chat()}}},'Delete')]}))))},
 async Prices(){const q=E('input',{placeholder:'search skin'}),out=E('div'),run=async()=>{const r=await api('prices',{q:q.value});const s=r.status;out.replaceChildren(E('div',{cls:'grid'},K('Last refresh',s.updated?dt(s.updated):'never',s.updated?'g':'y'),K('Skins priced live',s.live+' / '+r.total),K('Prices moved from base',r.moved),K('Last error',s.err||'none',s.err?'r':'g')),
   tbl(['Skin',{t:'Base',n:1},{t:'Now',n:1},{t:'Change',n:1}],r.items.map(x=>({cells:[x.name,fmt(x.base),fmt(x.price),((x.price/x.base-1)*100).toFixed(1)+'%']}))))};

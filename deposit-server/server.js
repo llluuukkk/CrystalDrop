@@ -161,12 +161,14 @@ const sortKeys = o => Array.isArray(o) ? o.map(sortKeys) : o && typeof o === 'ob
 const pub = d => ({ id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr });
 
 const PLAY = require('./play.js')({ db, send, readBody, authUser, cfg });
-const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, killSessions: uid => ET.killSess.run(uid) });
+const SPORTS = require('./sports.js')({ db, send, readBody, authUser, cfg, PLAY });
+const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, SPORTS, killSessions: uid => ET.killSess.run(uid) });
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), ip = req.socket.remoteAddress;
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (await ADMIN.route(req, res, url)) return;
+    if (await SPORTS.route(req, res, url)) return;
     if (await PLAY.route(req, res, url)) return;
     if (req.method === 'POST' && url.pathname === '/captcha/verify') {      // Cloudflare Turnstile check (set TURNSTILE_SECRET)
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }

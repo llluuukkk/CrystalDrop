@@ -193,5 +193,5 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
       return send(res, 404, { error: 'not found' }), true;
     } catch (e) { if (e.user) return send(res, 400, { error: e.message }), true; console.error('play error', e); return send(res, 500, { error: 'server error' }), true; }
   }
-  return { route, wout, W, tx, fairGet, refreshPrices, priceStatus: () => ({ updated: PRICE.updated, live: PRICE.live, err: PRICE.err }), catalog: () => UPCAT.map(x => ({ id: x.id, name: x.name, base: x.base, price: x.price })) };
+  return { kit: { tx, W, wout, spend, earn, toC, toCR, MAXPAY_C }, route, wout, W, tx, fairGet, refreshPrices, priceStatus: () => ({ updated: PRICE.updated, live: PRICE.live, err: PRICE.err }), catalog: () => UPCAT.map(x => ({ id: x.id, name: x.name, base: x.base, price: x.price })) };
 };
