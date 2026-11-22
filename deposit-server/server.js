@@ -27,8 +27,8 @@ const cfg = {
   email: { provider: E.EMAIL_PROVIDER || (E.RESEND_API_KEY ? 'resend' : 'console'), resendKey: E.RESEND_API_KEY || '', from: E.EMAIL_FROM || 'CrystalDrop <no-reply@example.com>' },
 };
 // coin + network (as the page sends them) -> NOWPayments pay_currency code. Verify against GET /v1/currencies for your account.
-const COINS = {   // deposits: BTC, ETH, SOL only
-  'BTC|Bitcoin': { code: 'btc', conf: 2 }, 'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12 }, 'SOL|Solana': { code: 'sol', conf: 32 },
+const COINS = {   // deposits: Solana only
+  'SOL|Solana': { code: 'sol', conf: 32 },
 };
 if (cfg.provider === 'nowpayments' && (!cfg.apiKey || !cfg.ipnSecret || !cfg.publicUrl)) { console.error('NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET and PUBLIC_URL are required for the nowpayments provider.'); process.exit(1); }
 
@@ -63,6 +63,7 @@ let _fresh = false; for (const c of ['bal_c', 'pool_c', 'vault_c', 'lock_c']) { 
 if (_fresh) db.exec('UPDATE users SET bal_c = CAST(ROUND((SELECT COALESCE(SUM(amount),0) FROM ledger WHERE ledger.user_id = users.id) * 100) AS INTEGER)');
 try { db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0'); } catch (e) {}
 try { db.exec('ALTER TABLE deposits ADD COLUMN items TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE deposits ADD COLUMN open INTEGER DEFAULT 0'); } catch (e) {}      // 1 = open-amount deposit: credited for whatever is actually sent
 try { db.exec('ALTER TABLE deposits ADD COLUMN trade_url TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE users ADD COLUMN name_set INTEGER DEFAULT 1'); } catch (e) {}      // 0 = Steam player still has to choose a name
 const NAME_RE = /^[A-Za-z0-9]{3,15}$/;                                                          // display names: 3 to 15 letters and numbers only
@@ -88,9 +89,14 @@ function creditDeposit(d) {
   catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 const MAP = { waiting: 'pending', confirming: 'confirming', confirmed: 'confirming', sending: 'confirming', partially_paid: 'partial', finished: 'credited', expired: 'expired', failed: 'expired', refunded: 'expired' };
-function applyStatus(d, raw, txid) {
+function applyStatus(d, raw, txid, paidCR) {
   const st = MAP[raw] || 'pending';
   if (d.status === 'credited') return d.status;                                // final
+  if (st === 'credited' && d.open && paidCR > 0) {                              // open deposit: credit what was really received (rounded down to the cent, capped)
+    const amt = Math.min(cfg.max, Math.floor(paidCR * 100) / 100);
+    if (!(amt >= cfg.min)) { q.upd.run('partial', d.confirmations, txid || null, raw, d.id); log(d.id, 'PAYMENT BELOW MINIMUM (' + paidCR + ' CR) — needs manual review'); return 'partial'; }
+    db.prepare('UPDATE deposits SET amount_cr=? WHERE id=?').run(amt, d.id); d = { ...d, amount_cr: amt };
+  }
   if (st === 'credited') { q.upd.run('credited', d.required, txid || null, raw, d.id); creditDeposit({ ...d }); log(d.id, 'credited ' + d.amount_cr + ' CR'); return 'credited'; }
   q.upd.run(st, st === 'confirming' ? Math.max(d.confirmations, 1) : d.confirmations, txid || null, raw, d.id); if (st === 'partial') log(d.id, 'PARTIAL PAYMENT — needs manual review'); return st;
 }
@@ -136,13 +142,13 @@ async function steamVerify(params) {                                            
 
 // ---- providers ----
 const MINC = {};
-async function minCR(coin) {   // provider minimum in CR (1 CR = $1), +15% headroom for rate moves, cached 10 min
+async function minCR(coin) {   // provider minimum in CR (1 CR = $1), exactly as NOWPayments reports it, cached 10 min
   if (cfg.provider !== 'nowpayments') return cfg.min;
   const c = MINC[coin.code]; if (c && Date.now() - c.at < 600000) return c.v;
   let v = cfg.min;
   try {
     const r = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/min-amount?currency_from=' + coin.code + '&currency_to=' + coin.code + '&fiat_equivalent=usd&is_fixed_rate=True', { headers: { 'x-api-key': cfg.apiKey }, signal: AbortSignal.timeout(15000) });
-    const j = await r.json().catch(() => ({})); const m = +j.fiat_equivalent; if (r.ok && m > 0) v = Math.max(cfg.min, Math.ceil(m * 1.15 * 100) / 100);
+    const j = await r.json().catch(() => ({})); const m = +j.fiat_equivalent; if (r.ok && m > 0) v = Math.max(cfg.min, Math.ceil(m * 100) / 100);
   } catch (e) { if (c) return c.v; }
   MINC[coin.code] = { v, at: Date.now() }; return v;
 }
@@ -167,7 +173,7 @@ const humanOk = req => { if (!E.TURNSTILE_SECRET) return true; const m = /^(\d{1
 const send = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': cfg.allowOrigin, 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Human', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS' }); res.end(b); };
 const readBody = req => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) { no(new Error('too large')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); });
 const sortKeys = o => Array.isArray(o) ? o.map(sortKeys) : o && typeof o === 'object' ? Object.fromEntries(Object.keys(o).sort().map(k => [k, sortKeys(o[k])])) : o;
-const pub = d => ({ id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr });
+const pub = d => ({ open: !!d.open, id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr });
 
 const PLAY = require('./play.js')({ db, send, readBody, authUser, cfg });
 const SPORTS = require('./sports.js')({ db, send, readBody, authUser, cfg, PLAY });
@@ -353,14 +359,21 @@ const server = http.createServer(async (req, res) => {
       if (!pubUser(au).verified) return send(res, 403, { error: 'confirm your email address first (check your inbox)' });
       if (limited(ip)) return send(res, 429, { error: 'too many requests' });
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
-      const amount = +b.amountCR, coin = COINS[b.coin + '|' + b.network], userId = au.id;                                                  // always the signed-in account, never what the page claims
+      const coin = COINS[b.coin + '|' + b.network], userId = au.id, open = !(+b.amountCR > 0);                                           // always the signed-in account, never what the page claims
       if (!coin) return send(res, 400, { error: 'unsupported coin/network' });
+      if (open) {                                                                   // no amount asked for: hand out an address that is credited for whatever is sent (at least the minimum)
+        const old = db.prepare("SELECT * FROM deposits WHERE user_id=? AND coin=? AND network=? AND open=1 AND status IN ('pending','confirming') AND expires_at>? ORDER BY created_at DESC LIMIT 1").get(userId, b.coin, b.network, Date.now());
+        if (old) return send(res, 200, { id: old.id, address: old.address, memo: old.memo, cryptoAmount: old.crypto_amount, cryptoAmt: old.crypto_amount, rate: old.rate, expiresAt: new Date(old.expires_at).toISOString(), confirmationsRequired: old.required, open: true, minCR: old.amount_cr });
+      }
+      const amount = open ? await minCR(coin) : +b.amountCR;
       if (!(amount >= cfg.min && amount <= cfg.max)) return send(res, 400, { error: `amount must be between ${cfg.min} and ${cfg.max} CR` });
-      const d = { id: 'dep_' + crypto.randomBytes(8).toString('hex'), user_id: userId, coin: b.coin, network: b.network, amount_cr: +amount.toFixed(2), required: coin.conf };
-      const p = await providers[cfg.provider](d, coin), exp = Date.now() + cfg.ttlMin * 60000;
+      const d = { id: 'dep_' + crypto.randomBytes(8).toString('hex'), user_id: userId, coin: b.coin, network: b.network, amount_cr: +amount.toFixed(2), required: coin.conf, open };
+      let p; try { p = await providers[cfg.provider](d, coin); } catch (e) { if (open && /too small/i.test(e.message)) { d.amount_cr = +(d.amount_cr * 1.15).toFixed(2); p = await providers[cfg.provider](d, coin); } else throw e; }   // rate moved since the minimum was read: retry just above it
+      const exp = Date.now() + (open ? Math.max(cfg.ttlMin, 360) : cfg.ttlMin) * 60000;
       q.ins.run(d.id, userId, b.coin, b.network, d.amount_cr, p.cryptoAmount, p.rate, p.address, p.memo, cfg.provider, p.providerId, 'pending', coin.conf, Date.now(), exp);
+      if (open) db.prepare('UPDATE deposits SET open=1 WHERE id=?').run(d.id);
       log(d.id, 'created ' + b.coin + ' ' + p.cryptoAmount);
-      return send(res, 200, { id: d.id, address: p.address, memo: p.memo, cryptoAmount: p.cryptoAmount, cryptoAmt: p.cryptoAmount, rate: p.rate, expiresAt: new Date(exp).toISOString(), confirmationsRequired: coin.conf });
+      return send(res, 200, { id: d.id, address: p.address, memo: p.memo, cryptoAmount: p.cryptoAmount, cryptoAmt: p.cryptoAmount, rate: p.rate, expiresAt: new Date(exp).toISOString(), confirmationsRequired: coin.conf, open, minCR: open ? d.amount_cr : undefined });
     }
     let m;
     if (req.method === 'GET' && url.pathname === '/skin-deposits/config') return send(res, 200, { enabled: cfg.skins !== 'off', demo: cfg.skins === 'mock', rate: cfg.skinRate, maxItems: cfg.skinMaxItems, min: cfg.min, max: cfg.max, ttlMin: cfg.skinTtlMin, bot: cfg.skinBot });
@@ -399,12 +412,13 @@ const server = http.createServer(async (req, res) => {
       const ok = sig.length === want.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want));
       if (!ok) { log(null, 'webhook with bad signature from ' + ip); return send(res, 401, { error: 'bad signature' }); }
       const d = q.byProv.get(String(body.payment_id)); if (!d) return send(res, 200, { ok: true, ignored: true });
-      const st = applyStatus(d, body.payment_status, body.payin_hash || body.payout_hash);
+      const paid = +body.actually_paid_at_fiat > 0 ? +body.actually_paid_at_fiat : (+body.actually_paid > 0 ? +body.actually_paid * (d.rate || 0) : 0);
+      const st = applyStatus(d, body.payment_status, body.payin_hash || body.payout_hash, paid);
       return send(res, 200, { ok: true, status: st });
     }
     if (cfg.provider === 'mock' && req.method === 'POST' && (m = url.pathname.match(/^\/dev\/pay\/([\w-]+)$/))) {   // test helper, mock mode only
       const d = q.get.get(m[1]); if (!d) return send(res, 404, { error: 'not found' });
-      const st = applyStatus(d, new URL(req.url, 'http://x').searchParams.get('status') || 'finished', 'mocktx_' + crypto.randomBytes(4).toString('hex')); return send(res, 200, { status: st });
+      const sp = new URL(req.url, 'http://x').searchParams, st = applyStatus(d, sp.get('status') || 'finished', 'mocktx_' + crypto.randomBytes(4).toString('hex'), +sp.get('paid') || 0); return send(res, 200, { status: st });
     }
     if (req.method === 'GET' && (m = url.pathname.match(/^\/balance\/([^/]+)$/))) {                                     // credited-by-deposit total for a user (admin only)
       if (!cfg.adminToken || req.headers.authorization !== 'Bearer ' + cfg.adminToken) return send(res, 401, { error: 'unauthorized' });
