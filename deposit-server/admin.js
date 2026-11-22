@@ -1,0 +1,183 @@
+'use strict';
+// Admin panel: GET /admin serves the page, POST /admin/api/* is the JSON API. Everything needs ADMIN_TOKEN (Bearer).
+const crypto = require('crypto');
+
+module.exports = function init({ db, cfg, send, readBody, PLAY, killSessions }) {
+  db.exec(`CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, action TEXT, target TEXT, detail TEXT, ip TEXT);`);
+  try { db.exec('ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
+  try { db.exec('ALTER TABLE users ADD COLUMN ban_reason TEXT'); } catch (e) {}
+
+  const fails = new Map();                                    // wrong-token attempts per IP: 10 per 15 min
+  const ipOf = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',').pop().trim();
+  const tokOk = req => { const a = Buffer.from(String((req.headers.authorization || '').replace(/^Bearer /, ''))), b = Buffer.from(cfg.adminToken || '');
+    return !!cfg.adminToken && a.length === b.length && crypto.timingSafeEqual(a, b); };
+  function gate(req, res) {
+    const ip = ipOf(req), now = Date.now(), a = (fails.get(ip) || []).filter(t => now - t < 9e5);
+    if (a.length >= 10) { send(res, 429, { error: 'too many wrong tokens, wait 15 minutes' }); return false; }
+    if (!tokOk(req)) { a.push(now); fails.set(ip, a); send(res, 401, { error: cfg.adminToken ? 'wrong token' : 'ADMIN_TOKEN is not set on the server' }); return false; }
+    return true;
+  }
+  const audit = (req, action, target, detail) => db.prepare('INSERT INTO admin_log (ts,action,target,detail,ip) VALUES (?,?,?,?,?)').run(Date.now(), action, String(target || ''), String(detail || '').slice(0, 300), ipOf(req));
+  const cr = c => Math.round(c || 0) / 100;
+  const one = (sql, ...a) => db.prepare(sql).get(...a);
+  const all = (sql, ...a) => db.prepare(sql).all(...a);
+  const lim = (n, d, m) => Math.max(1, Math.min(m, Math.floor(+n) || d));
+
+  const API = {
+    overview() {
+      const D = Date.now() - 864e5, r = one('SELECT COUNT(*) n, COALESCE(SUM(bal_c),0) bal, COALESCE(SUM(pool_c),0) pool, COALESCE(SUM(vault_c),0) vault FROM users');
+      const sk = one('SELECT COUNT(*) n, COALESCE(SUM(price_c),0) v FROM skins');
+      const t = one('SELECT COUNT(*) n, COALESCE(SUM(stake_c),0) st, COALESCE(SUM(payout_c),0) po FROM rounds');
+      const d = one('SELECT COUNT(*) n, COALESCE(SUM(stake_c),0) st, COALESCE(SUM(payout_c),0) po, COUNT(DISTINCT user_id) pl FROM rounds WHERE ts > ?', D);
+      const dep = one("SELECT COUNT(*) n, COALESCE(SUM(amount_cr),0) s FROM deposits WHERE credited_at IS NOT NULL");
+      const dep24 = one("SELECT COALESCE(SUM(amount_cr),0) s FROM deposits WHERE credited_at > ?", D);
+      const big = all('SELECT id, name, game, stake_c, payout_c, mult, ts FROM rounds WHERE ts > ? ORDER BY payout_c DESC LIMIT 5', D).map(x => ({ ...x, stake: cr(x.stake_c), payout: cr(x.payout_c) }));
+      return { users: r.n, new24: one('SELECT COUNT(*) n FROM users WHERE created_at > ?', D).n, banned: one('SELECT COUNT(*) n FROM users WHERE banned=1').n,
+        owed: { balances: cr(r.bal), staked: cr(r.pool), vault: cr(r.vault), total: cr(r.bal + r.pool + r.vault), skins: cr(sk.v), skinCount: sk.n },
+        all: { rounds: t.n, wagered: cr(t.st), paid: cr(t.po), house: cr(t.st - t.po) }, day: { rounds: d.n, players: d.pl, wagered: cr(d.st), paid: cr(d.po), house: cr(d.st - d.po) },
+        deposits: { count: dep.n, total: +dep.s.toFixed(2), day: +dep24.s.toFixed(2) }, openRounds: one('SELECT COUNT(*) n FROM sess').n, big, provider: cfg.provider, turnstile: !!process.env.TURNSTILE_SECRET, now: Date.now() };
+    },
+    users(b) {
+      const q = String(b.q || '').trim(), off = Math.max(0, +b.offset || 0), L = lim(b.limit, 30, 100), like = '%' + q.replace(/[%_\\]/g, '') + '%';
+      const sort = { new: 'created_at DESC', bal: '(bal_c+pool_c+vault_c) DESC', name: 'name COLLATE NOCASE' }[b.sort] || 'created_at DESC';
+      const rows = q ? all(`SELECT * FROM users WHERE name LIKE ? OR email LIKE ? OR id = ? OR steam_id = ? ORDER BY ${sort} LIMIT ? OFFSET ?`, like, like, q, q, L, off) : all(`SELECT * FROM users ORDER BY ${sort} LIMIT ? OFFSET ?`, L, off);
+      return { users: rows.map(u => ({ id: u.id, name: u.name, email: u.email, steam: !!u.steam_id, verified: !!u.email_verified, banned: !!u.banned, created: u.created_at, bal: cr(u.bal_c), pool: cr(u.pool_c), vault: cr(u.vault_c), lock: cr(u.lock_c) })) };
+    },
+    user(b) {
+      const u = one('SELECT * FROM users WHERE id=?', String(b.id || '')); if (!u) throw Object.assign(new Error('no such user'), { code: 404 });
+      const w = one('SELECT COUNT(*) n, COALESCE(SUM(stake_c),0) st, COALESCE(SUM(payout_c),0) po FROM rounds WHERE user_id=?', u.id);
+      const dep = one('SELECT COALESCE(SUM(amount_cr),0) s, COUNT(*) n FROM deposits WHERE user_id=? AND credited_at IS NOT NULL', u.id);
+      const mute = one('SELECT until FROM mutes WHERE user_id=?', u.id);
+      return { user: { id: u.id, name: u.name, email: u.email, steam: u.steam_id, verified: !!u.email_verified, banned: !!u.banned, banReason: u.ban_reason, created: u.created_at, bal: cr(u.bal_c), pool: cr(u.pool_c), vault: cr(u.vault_c), lock: cr(u.lock_c), muted: mute && mute.until > Date.now() ? mute.until : 0 },
+        stats: { rounds: w.n, wagered: cr(w.st), paid: cr(w.po), net: cr(w.po - w.st), deposited: +dep.s.toFixed(2), deposits: dep.n },
+        skins: all('SELECT uid, item, price_c FROM skins WHERE user_id=? ORDER BY price_c DESC LIMIT 100', u.id).map(s => ({ uid: s.uid, price: cr(s.price_c) })),
+        rounds: all('SELECT id, game, stake_c, payout_c, mult, label, ts FROM rounds WHERE user_id=? ORDER BY id DESC LIMIT 30', u.id).map(x => ({ id: x.id, game: x.game, stake: cr(x.stake_c), payout: cr(x.payout_c), mult: x.mult, label: x.label, ts: x.ts })),
+        ledger: all('SELECT amount, reason, created_at FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 20', u.id) };
+    },
+    ban(b, req) {
+      const u = one('SELECT id, name FROM users WHERE id=?', String(b.id || '')); if (!u) throw Object.assign(new Error('no such user'), { code: 404 });
+      const on = b.banned ? 1 : 0, why = String(b.reason || '').slice(0, 200);
+      db.prepare('UPDATE users SET banned=?, ban_reason=? WHERE id=?').run(on, on ? why : null, u.id); if (on) killSessions(u.id);
+      audit(req, on ? 'ban' : 'unban', u.id + ' ' + u.name, why); return { ok: true };
+    },
+    mute(b, req) {
+      const u = one('SELECT id, name FROM users WHERE id=?', String(b.id || '')); if (!u) throw Object.assign(new Error('no such user'), { code: 404 });
+      const m = Math.max(0, Math.min(525600, Math.floor(+b.minutes) || 0));
+      if (!m) db.prepare('DELETE FROM mutes WHERE user_id=?').run(u.id); else db.prepare('INSERT OR REPLACE INTO mutes (user_id, until) VALUES (?,?)').run(u.id, Date.now() + m * 60000);
+      audit(req, m ? 'mute' : 'unmute', u.id + ' ' + u.name, m + ' min'); return { ok: true };
+    },
+    adjust(b, req) {        // credit or debit CR with a mandatory reason; goes through the same ledger as deposits
+      const amt = Math.round((+b.amount || 0) * 100), why = String(b.reason || '').trim().slice(0, 200);
+      if (!amt || Math.abs(amt) > 100000000) throw new Error('amount must be a non-zero number'); if (why.length < 4) throw new Error('write a reason (4+ characters)');
+      return PLAY.tx(() => { const u = one('SELECT id, name, bal_c FROM users WHERE id=?', String(b.id || '')); if (!u) throw Object.assign(new Error('no such user'), { code: 404 });
+        if (u.bal_c + amt < 0) throw new Error('that would take the balance below zero (' + cr(u.bal_c) + ' CR available)');
+        db.prepare('UPDATE users SET bal_c = bal_c + ? WHERE id=?').run(amt, u.id);
+        db.prepare('INSERT INTO ledger (user_id, amount, reason, ref, created_at) VALUES (?,?,?,?,?)').run(u.id, amt / 100, 'admin: ' + why, 'adm:' + crypto.randomBytes(8).toString('hex'), Date.now());
+        audit(req, amt > 0 ? 'credit' : 'debit', u.id + ' ' + u.name, (amt / 100) + ' CR: ' + why); return { ok: true, bal: cr(u.bal_c + amt) }; });
+    },
+    rounds(b) {
+      const L = lim(b.limit, 50, 200), w = [], a = [];
+      if (b.user) { w.push('user_id = ?'); a.push(String(b.user)); } if (b.game) { w.push('game = ?'); a.push(String(b.game)); }
+      if (+b.minPayout > 0) { w.push('payout_c >= ?'); a.push(Math.round(+b.minPayout * 100)); }
+      return { rounds: all(`SELECT id, user_id, name, game, stake_c, payout_c, mult, label, n, ts FROM rounds ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`, ...a, L).map(x => ({ id: x.id, uid: x.user_id, name: x.name, game: x.game, stake: cr(x.stake_c), payout: cr(x.payout_c), mult: x.mult, label: x.label, n: x.n, ts: x.ts })),
+        games: all('SELECT game, COUNT(*) n, SUM(stake_c) st, SUM(payout_c) po FROM rounds GROUP BY game ORDER BY n DESC').map(g => ({ game: g.game, rounds: g.n, wagered: cr(g.st), paid: cr(g.po), rtp: g.st ? +(g.po / g.st * 100).toFixed(2) : 0 })) };
+    },
+    deposits(b) {
+      const L = lim(b.limit, 50, 200), st = String(b.status || '');
+      return { deposits: all(`SELECT d.id, d.user_id, u.name, d.coin, d.network, d.amount_cr, d.status, d.txid, d.created_at, d.credited_at FROM deposits d LEFT JOIN users u ON u.id = d.user_id ${st ? 'WHERE d.status = ?' : ''} ORDER BY d.created_at DESC LIMIT ?`, ...(st ? [st] : []), L) };
+    },
+    chat(b) { return { chat: all('SELECT id, user_id, name, text, ts FROM chat ORDER BY id DESC LIMIT ?', lim(b.limit, 60, 200)) }; },
+    chatDelete(b, req) { const n = db.prepare('DELETE FROM chat WHERE id=?').run(+b.id).changes; audit(req, 'chat delete', b.id, ''); return { deleted: n }; },
+    prices(b) {
+      const items = PLAY.catalog(), moved = items.filter(x => x.price !== x.base).length, q = String(b.q || '').toLowerCase();
+      return { status: PLAY.priceStatus(), total: items.length, moved, items: items.filter(x => !q || x.name.toLowerCase().includes(q)).slice(0, 60) };
+    },
+    async pricesRefresh(b, req) { await PLAY.refreshPrices(); audit(req, 'price refresh', '', ''); return { status: PLAY.priceStatus() }; },
+    log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
+  };
+  const ROUTES = { overview: API.overview, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, 'prices/refresh': API.pricesRefresh, log: API.log };
+
+  async function route(req, res, url) {
+    const P = url.pathname;
+    if (req.method === 'GET' && (P === '/admin' || P === '/admin/')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'X-Robots-Tag': 'noindex, nofollow',
+        'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" });
+      res.end(PAGE); return true;
+    }
+    const m = /^\/admin\/api\/([\w/]+)$/.exec(P); if (!m || req.method !== 'POST' || !ROUTES[m[1]]) return false;
+    if (!gate(req, res)) return true;
+    let b = {}; try { const t = await readBody(req); if (t) b = JSON.parse(t); } catch (e) { send(res, 400, { error: 'bad json' }); return true; }
+    try { send(res, 200, await ROUTES[m[1]](b, req)); } catch (e) { send(res, e.code === 404 ? 404 : 400, { error: e.message || 'error' }); }
+    return true;
+  }
+  return { route };
+};
+
+const PAGE = String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>CrystalDrop Admin</title>
+<style>
+:root{--bg:#0b0d12;--p:#141822;--p2:#1b2030;--b:#262d40;--t:#e7eaf2;--m:#8a93a8;--a:#7c5cff;--g:#34d399;--r:#f87171;--y:#fbbf24}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b);position:sticky;top:0;background:var(--bg);z-index:5;flex-wrap:wrap}
+header b{font-size:16px}nav{display:flex;gap:4px;flex-wrap:wrap;flex:1}nav button{background:none;border:0;color:var(--m);padding:7px 11px;border-radius:8px;cursor:pointer;font:inherit}
+nav button.on{background:var(--p2);color:var(--t)}main{padding:16px;max-width:1200px;margin:0 auto}
+.card{background:var(--p);border:1px solid var(--b);border-radius:12px;padding:14px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px;margin-bottom:14px}
+.k{background:var(--p);border:1px solid var(--b);border-radius:12px;padding:12px}.k small{color:var(--m);display:block;font-size:12px}.k b{font-size:20px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--b);vertical-align:top}th{color:var(--m);font-weight:500;font-size:12px}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}.wrap{overflow-x:auto}tr.click{cursor:pointer}tr.click:hover{background:var(--p2)}
+input,select,button.b{background:var(--p2);border:1px solid var(--b);color:var(--t);border-radius:8px;padding:8px 10px;font:inherit}
+button.b{cursor:pointer}button.b:hover{border-color:var(--a)}button.pri{background:var(--a);border-color:var(--a)}button.red{border-color:var(--r);color:var(--r)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.m{color:var(--m)}
+.tag{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;background:var(--p2);border:1px solid var(--b)}
+#login{max-width:360px;margin:12vh auto;text-align:center}#login input{width:100%;margin:12px 0}h3{margin:0 0 10px}#msg{position:fixed;bottom:14px;right:14px;background:var(--p2);border:1px solid var(--b);padding:10px 14px;border-radius:10px;max-width:80vw}
+</style></head><body>
+<div id="login" class="card"><h3>CrystalDrop admin</h3><div class="m">Enter the ADMIN_TOKEN from your server settings.</div><input id="tok" type="password" autocomplete="off" placeholder="admin token"><button class="b pri" id="go">Sign in</button><div id="lerr" class="r" style="margin-top:10px"></div></div>
+<div id="app" hidden><header><b>CrystalDrop admin</b><nav id="nav"></nav><button class="b" id="out">Sign out</button></header><main id="main"></main></div><div id="msg" hidden></div>
+<script>
+const $=s=>document.querySelector(s);let TOKEN='';try{TOKEN=sessionStorage.getItem('cd_admin')||''}catch(e){}
+const E=(t,a,...k)=>{const e=document.createElement(t);if(a)for(const x in a){if(x==='on')for(const y in a.on)e.addEventListener(y,a.on[y]);else if(x==='cls')e.className=a[x];else e.setAttribute(x,a[x])}for(const c of k.flat())if(c!=null)e.append(c.nodeType?c:String(c));return e};
+const fmt=n=>(+n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}),dt=t=>t?new Date(t).toLocaleString():'-';
+let T;function toast(s,bad){const m=$('#msg');m.textContent=s;m.style.borderColor=bad?'var(--r)':'var(--g)';m.hidden=false;clearTimeout(T);T=setTimeout(()=>m.hidden=true,3500)}
+async function api(p,b){const r=await fetch('/admin/api/'+p,{method:'POST',headers:{Authorization:'Bearer '+TOKEN,'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json().catch(()=>({}));if(!r.ok){if(r.status===401){signout()}throw new Error(j.error||('HTTP '+r.status))}return j}
+function signout(){TOKEN='';try{sessionStorage.removeItem('cd_admin')}catch(e){}$('#app').hidden=true;$('#login').hidden=false}
+$('#out').onclick=signout;
+$('#go').onclick=async()=>{TOKEN=$('#tok').value.trim();$('#lerr').textContent='';try{await api('overview');try{sessionStorage.setItem('cd_admin',TOKEN)}catch(e){}start()}catch(e){$('#lerr').textContent=e.message}};
+$('#tok').addEventListener('keydown',e=>{if(e.key==='Enter')$('#go').click()});
+const TABS=['Overview','Players','Rounds','Deposits','Chat','Prices','Log'];let tab='Overview';
+function start(){$('#login').hidden=true;$('#app').hidden=false;const nav=$('#nav');nav.replaceChildren(...TABS.map(t=>E('button',{cls:t===tab?'on':'',on:{click:()=>{tab=t;start()}}},t)));VIEW[tab]().catch(e=>toast(e.message,1))}
+const tbl=(heads,rows,onrow)=>E('div',{cls:'wrap'},E('table',null,E('thead',null,E('tr',null,heads.map(h=>E('th',{cls:h.n?'n':''},h.t||h)))),E('tbody',null,rows.map(r=>{const tr=E('tr',onrow?{cls:'click',on:{click:()=>onrow(r)}}:null,r.cells.map((c,i)=>E('td',{cls:heads[i]&&heads[i].n?'n':''},c)));return tr}))));
+const K=(l,v,c)=>E('div',{cls:'k'},E('small',null,l),E('b',{cls:c||''},v));
+const show=(...n)=>$('#main').replaceChildren(...n);
+const VIEW={
+async Overview(){const o=await api('overview');const pc=n=>n>=0?'g':'r';
+ show(E('div',{cls:'grid'},K('Players',o.users),K('New (24h)',o.new24),K('Banned',o.banned,o.banned?'y':''),K('Open rounds',o.openRounds)),
+ E('h3',null,'What you owe players (CR)'),E('div',{cls:'grid'},K('Total owed',fmt(o.owed.total)),K('Cash balances',fmt(o.owed.balances)),K('Skins staked',fmt(o.owed.staked)),K('Vault',fmt(o.owed.vault)),K('Skins in inventories',fmt(o.owed.skins)+' ('+o.owed.skinCount+')')),
+ E('h3',null,'House result (CR wagered minus paid)'),E('div',{cls:'grid'},K('Last 24h',fmt(o.day.house),pc(o.day.house)),K('24h wagered',fmt(o.day.wagered)),K('24h rounds / players',o.day.rounds+' / '+o.day.players),K('All time',fmt(o.all.house),pc(o.all.house)),K('All time wagered',fmt(o.all.wagered)),K('All time rounds',o.all.rounds)),
+ E('h3',null,'Deposits'),E('div',{cls:'grid'},K('Credited (all)',fmt(o.deposits.total)+' CR'),K('Credited (24h)',fmt(o.deposits.day)+' CR'),K('Payment provider',o.provider,o.provider==='mock'?'y':'g'),K('Bot check (Turnstile)',o.turnstile?'on':'OFF',o.turnstile?'g':'y')),
+ E('h3',null,'Biggest payouts (24h)'),tbl(['Player','Game',{t:'Stake',n:1},{t:'Payout',n:1},{t:'x',n:1},'When'],o.big.map(x=>({cells:[x.name,x.game,fmt(x.stake),fmt(x.payout),x.mult,dt(x.ts)]}))))},
+async Players(){const q=E('input',{placeholder:'name, email, id or steam id',value:VIEW._q||''}),s=E('select',null,E('option',{value:'new'},'Newest'),E('option',{value:'bal'},'Highest balance'),E('option',{value:'name'},'Name'));s.value=VIEW._s||'new';
+ const out=E('div'),run=async()=>{VIEW._q=q.value;VIEW._s=s.value;const r=await api('users',{q:q.value,sort:s.value,limit:50});out.replaceChildren(tbl(['Name','Email',{t:'Cash',n:1},{t:'Staked',n:1},'Status','Joined'],r.users.map(u=>({id:u.id,cells:[u.name,u.email||(u.steam?'Steam':''),fmt(u.bal),fmt(u.pool),[u.banned?E('span',{cls:'tag r'},'banned '):null,u.verified?null:E('span',{cls:'tag y'},'unverified')],dt(u.created)]})),r=>PLAYER(r.id)))};
+ q.addEventListener('keydown',e=>{if(e.key==='Enter')run()});s.onchange=run;show(E('div',{cls:'row'},q,s,E('button',{cls:'b pri',on:{click:run}},'Search')),out);await run()},
+async Rounds(){const u=E('input',{placeholder:'user id (optional)'}),g=E('input',{placeholder:'game (optional)'}),mp=E('input',{placeholder:'min payout CR',size:12}),out=E('div'),
+ run=async()=>{const r=await api('rounds',{user:u.value.trim(),game:g.value.trim(),minPayout:mp.value,limit:100});out.replaceChildren(E('h3',null,'Per game (all time)'),tbl(['Game',{t:'Rounds',n:1},{t:'Wagered',n:1},{t:'Paid',n:1},{t:'RTP %',n:1}],r.games.map(x=>({cells:[x.game,x.rounds,fmt(x.wagered),fmt(x.paid),x.rtp]}))),E('h3',{style:'margin-top:16px'},'Latest rounds'),tbl([{t:'#',n:1},'Player','Game',{t:'Stake',n:1},{t:'Payout',n:1},{t:'x',n:1},'Result','When'],r.rounds.map(x=>({id:x.uid,cells:[x.id,x.name,x.game,fmt(x.stake),fmt(x.payout),x.mult,x.label,dt(x.ts)]})),r=>PLAYER(r.id)))};
+ show(E('div',{cls:'row'},u,g,mp,E('button',{cls:'b pri',on:{click:run}},'Filter')),out);await run()},
+async Deposits(){const s=E('select',null,['','finished','waiting','confirming','failed','expired'].map(x=>E('option',{value:x},x||'all statuses'))),out=E('div'),run=async()=>{const r=await api('deposits',{status:s.value,limit:100});out.replaceChildren(tbl(['Player','Coin',{t:'CR',n:1},'Status','Created','Credited'],r.deposits.map(d=>({id:d.user_id,cells:[d.name||d.user_id,d.coin+(d.network?' / '+d.network:''),fmt(d.amount_cr),d.status,dt(d.created_at),dt(d.credited_at)]})),r=>PLAYER(r.id)))};s.onchange=run;show(E('div',{cls:'row'},s),out);await run()},
+async Chat(){const r=await api('chat',{limit:100});show(tbl(['Player','Message','When',''],r.chat.map(m=>({cells:[m.name,m.text,dt(m.ts),E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();await api('chat/delete',{id:m.id});toast('Deleted');VIEW.Chat()}}},'Delete')]}))))},
+async Prices(){const q=E('input',{placeholder:'search skin'}),out=E('div'),run=async()=>{const r=await api('prices',{q:q.value});const s=r.status;out.replaceChildren(E('div',{cls:'grid'},K('Last refresh',s.updated?dt(s.updated):'never',s.updated?'g':'y'),K('Skins priced live',s.live+' / '+r.total),K('Prices moved from base',r.moved),K('Last error',s.err||'none',s.err?'r':'g')),
+  tbl(['Skin',{t:'Base',n:1},{t:'Now',n:1},{t:'Change',n:1}],r.items.map(x=>({cells:[x.name,fmt(x.base),fmt(x.price),((x.price/x.base-1)*100).toFixed(1)+'%']}))))};
+ q.addEventListener('keydown',e=>{if(e.key==='Enter')run()});show(E('div',{cls:'row'},q,E('button',{cls:'b',on:{click:run}},'Search'),E('button',{cls:'b pri',on:{click:async e=>{e.target.disabled=true;try{await api('prices/refresh');toast('Prices refreshed')}catch(x){toast(x.message,1)}e.target.disabled=false;run()}}},'Refresh prices now')),out);await run()},
+async Log(){const r=await api('log',{limit:200});show(tbl(['When','Action','Target','Detail','IP'],r.log.map(x=>({cells:[dt(x.ts),x.action,x.target,x.detail,x.ip]}))))},
+};
+async function PLAYER(id){const r=await api('user',{id}),u=r.user,s=r.stats,amt=E('input',{placeholder:'+50 or -20',size:10}),why=E('input',{placeholder:'reason (required)',size:28}),mins=E('input',{placeholder:'minutes',size:7,value:'60'}),bwhy=E('input',{placeholder:'ban reason',size:24});
+ const act=(fn,ok)=>async()=>{try{await fn();toast(ok);PLAYER(id)}catch(e){toast(e.message,1)}};
+ show(E('button',{cls:'b',on:{click:()=>start()}},'< Back'),E('div',{cls:'card',style:'margin-top:12px'},E('h3',null,u.name+' ',u.banned?E('span',{cls:'tag r'},'banned'):null,u.muted?E('span',{cls:'tag y'},' muted until '+dt(u.muted)):null),
+  E('div',{cls:'m'},'id '+u.id+' · '+(u.email||'steam '+u.steam)+' · '+(u.verified?'email verified':'email NOT verified')+' · joined '+dt(u.created)+(u.banned&&u.banReason?' · ban reason: '+u.banReason:''))),
+ E('div',{cls:'grid'},K('Cash',fmt(u.bal)),K('Skins staked',fmt(u.pool)),K('Vault',fmt(u.vault)),K('Locked (unwagered)',fmt(u.lock)),K('Wagered',fmt(s.wagered)),K('Net result for player',fmt(s.net),s.net>=0?'g':'r'),K('Rounds',s.rounds),K('Deposited',fmt(s.deposited)+' CR')),
+ E('div',{cls:'card'},E('h3',null,'Adjust balance'),E('div',{cls:'row'},amt,why,E('button',{cls:'b pri',on:{click:act(()=>api('adjust',{id,amount:amt.value,reason:why.value}),'Balance updated')}},'Apply')),E('div',{cls:'m'},'Use a plus to credit, a minus to debit. Every change is written to the ledger and the log.')),
+ E('div',{cls:'card'},E('h3',null,'Moderation'),E('div',{cls:'row'},mins,E('button',{cls:'b',on:{click:act(()=>api('mute',{id,minutes:mins.value}),'Muted')}},'Mute chat'),E('button',{cls:'b',on:{click:act(()=>api('mute',{id,minutes:0}),'Unmuted')}},'Unmute')),
+  E('div',{cls:'row'},u.banned?E('button',{cls:'b pri',on:{click:act(()=>api('ban',{id,banned:false}),'Unbanned')}},'Unban'):[bwhy,E('button',{cls:'b red',on:{click:act(()=>api('ban',{id,banned:true,reason:bwhy.value}),'Banned, sessions ended')}},'Ban player')])),
+ E('h3',null,'Latest rounds'),tbl(['Game',{t:'Stake',n:1},{t:'Payout',n:1},{t:'x',n:1},'Result','When'],r.rounds.map(x=>({cells:[x.game,fmt(x.stake),fmt(x.payout),x.mult,x.label,dt(x.ts)]}))),
+ E('h3',{style:'margin-top:16px'},'Ledger'),tbl([{t:'CR',n:1},'Reason','When'],r.ledger.map(x=>({cells:[fmt(x.amount),x.reason,dt(x.created_at)]}))),
+ E('h3',{style:'margin-top:16px'},'Skins ('+r.skins.length+')'),E('div',{cls:'m'},r.skins.map(x=>fmt(x.price)).join(' · ')||'none'))}
+if(TOKEN){api('overview').then(start).catch(()=>signout())}
+</script></body></html>`;

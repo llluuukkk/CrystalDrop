@@ -60,6 +60,9 @@ const q = {
   ev: db.prepare('INSERT INTO events (at,deposit_id,note) VALUES (?,?,?)'),
 };
 try { db.exec('ALTER TABLE users ADD COLUMN referred_by TEXT'); } catch (e) {}
+// balances now live here, in whole cents: bal_c (CR), pool_c (skins staked to play), vault_c, lock_c (CR bought but not yet wagered)
+let _fresh = false; for (const c of ['bal_c', 'pool_c', 'vault_c', 'lock_c']) { try { db.exec('ALTER TABLE users ADD COLUMN ' + c + ' INTEGER NOT NULL DEFAULT 0'); if (c === 'bal_c') _fresh = true; } catch (e) {} }
+if (_fresh) db.exec('UPDATE users SET bal_c = CAST(ROUND((SELECT COALESCE(SUM(amount),0) FROM ledger WHERE ledger.user_id = users.id) * 100) AS INTEGER)');
 try { db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0'); } catch (e) {}
 try { db.exec('ALTER TABLE deposits ADD COLUMN items TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE deposits ADD COLUMN trade_url TEXT'); } catch (e) {}
@@ -83,7 +86,7 @@ const log = (id, note) => { q.ev.run(Date.now(), id, String(note).slice(0, 300))
 // Credit exactly once: ledger.ref is UNIQUE, so a replayed webhook can't double-pay. Both statements run in one transaction.
 function creditDeposit(d) {
   db.exec('BEGIN IMMEDIATE');
-  try { const r = q.credit.run(d.user_id, d.amount_cr, 'crypto deposit ' + d.coin, 'dep:' + d.id, Date.now()); if (r.changes) q.mark.run(Date.now(), d.id); db.exec('COMMIT'); return !!r.changes; }
+  try { const r = q.credit.run(d.user_id, d.amount_cr, 'crypto deposit ' + d.coin, 'dep:' + d.id, Date.now()); if (r.changes) { q.mark.run(Date.now(), d.id); const c = Math.round(d.amount_cr * 100); db.prepare('UPDATE users SET bal_c = bal_c + ?, lock_c = lock_c + ? WHERE id=?').run(c, c, d.user_id); } db.exec('COMMIT'); return !!r.changes; }
   catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 const MAP = { waiting: 'pending', confirming: 'confirming', confirmed: 'confirming', sending: 'confirming', partially_paid: 'partial', finished: 'credited', expired: 'expired', failed: 'expired', refunded: 'expired' };
@@ -123,7 +126,7 @@ const sendVerify = async u => { const t = issueToken(u.id, 'verify', 48 * 36e5);
 const mailGap = new Map();                                                         // at most one email per address per minute
 const mailOk = key => { const now = Date.now(); if (now - (mailGap.get(key) || 0) < 60000) return false; mailGap.set(key, now); return true; };
 const startSession = uid => { const t = crypto.randomBytes(32).toString('hex'); U.sess.run(sha(t), uid, Date.now() + cfg.sessionDays * 864e5); return t; };
-const authUser = req => { const m = /^Bearer (\w{64})$/.exec(req.headers.authorization || ''); if (!m) return null; const s = U.getSess.get(sha(m[1])); if (!s || s.expires_at < Date.now()) return null; return U.byId.get(s.user_id) || null; };
+const authUser = req => { const m = /^Bearer (\w{64})$/.exec(req.headers.authorization || ''); if (!m) return null; const s = U.getSess.get(sha(m[1])); if (!s || s.expires_at < Date.now()) return null; const u = U.byId.get(s.user_id) || null; return u && u.banned ? null : u; };
 const tries = new Map();                                                         // login/signup attempts per IP: 12 per 15 min
 const tooMany = ip => { const now = Date.now(), a = (tries.get(ip) || []).filter(t => now - t < 9e5); a.push(now); tries.set(ip, a); return a.length > (+E.AUTH_RATE || 12); };
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
@@ -157,10 +160,14 @@ const readBody = req => new Promise((ok, no) => { let b = ''; req.on('data', c =
 const sortKeys = o => Array.isArray(o) ? o.map(sortKeys) : o && typeof o === 'object' ? Object.fromEntries(Object.keys(o).sort().map(k => [k, sortKeys(o[k])])) : o;
 const pub = d => ({ id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr });
 
+const PLAY = require('./play.js')({ db, send, readBody, authUser, cfg });
+const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, killSessions: uid => ET.killSess.run(uid) });
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), ip = req.socket.remoteAddress;
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
+    if (await ADMIN.route(req, res, url)) return;
+    if (await PLAY.route(req, res, url)) return;
     if (req.method === 'POST' && url.pathname === '/captcha/verify') {      // Cloudflare Turnstile check (set TURNSTILE_SECRET)
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       if (!E.TURNSTILE_SECRET) return send(res, 200, { ok: true, skipped: true });
@@ -168,7 +175,7 @@ const server = http.createServer(async (req, res) => {
         const okc = !!(await r.json()).success; return send(res, 200, okc ? { ok: true, pass: humanPass() } : { ok: false }); } catch (e) { return send(res, 502, { ok: false, error: 'captcha service unreachable' }); }
     }
     // ---- live chat and tips ----  Chat: 5 second gap per user, 200 characters, no links, muted users blocked. Tips: whole accounts by display name, claimed by the receiver's page.
-    const lastMsg = (globalThis.__lastMsg = globalThis.__lastMsg || new Map()), lastTip = (globalThis.__lastTip = globalThis.__lastTip || new Map()), lastFeed = (globalThis.__lastFeed = globalThis.__lastFeed || new Map());
+    const lastMsg = (globalThis.__lastMsg = globalThis.__lastMsg || new Map()), lastTip = (globalThis.__lastTip = globalThis.__lastTip || new Map());
     const CHAT_GAP = +E.CHAT_GAP_MS || 5000, TIP_MIN = 1, TIP_MAX = +E.TIP_MAX || 1000, TIP_DAY = +E.TIP_DAY || 5000;
     const needVerified = (u, res) => { if (!pubUser(u).verified) { send(res, 403, { error: 'confirm your email address first' }); return false; } return true; };
     if (req.method === 'GET' && url.pathname === '/chat') {
@@ -196,7 +203,10 @@ const server = http.createServer(async (req, res) => {
       if (!(amt >= TIP_MIN) || amt > TIP_MAX) return send(res, 400, { error: 'tips are ' + TIP_MIN + ' to ' + TIP_MAX + ' CR' });
       const now = Date.now(); if (now - (lastTip.get(u.id) || 0) < 5000) return send(res, 429, { error: 'wait a few seconds between tips' });
       const day = db.prepare('SELECT COALESCE(SUM(amount),0) s FROM tips WHERE from_id=? AND ts > ?').get(u.id, now - 864e5).s; if (day + amt > TIP_DAY) return send(res, 400, { error: 'daily tip limit is ' + TIP_DAY + ' CR' });
-      lastTip.set(u.id, now); const r = db.prepare('INSERT INTO tips (from_id, to_id, from_name, amount, ts) VALUES (?,?,?,?,?)').run(u.id, to.id, u.name, amt, now); return send(res, 200, { ok: true, id: Number(r.lastInsertRowid), to: to.name, amount: amt });
+      const c = Math.round(amt * 100); let fail = null; db.exec('BEGIN IMMEDIATE');
+      try { const w = db.prepare('SELECT bal_c, lock_c FROM users WHERE id=?').get(u.id); if (w.lock_c > 0) fail = 'Tipping is locked until you wager ' + (w.lock_c / 100).toFixed(2) + ' more CR.'; else if (w.bal_c < c) fail = 'Not enough CR.';
+        else { db.prepare('UPDATE users SET bal_c = bal_c - ? WHERE id=?').run(c, u.id); db.prepare('UPDATE users SET bal_c = bal_c + ? WHERE id=?').run(c, to.id); db.prepare('INSERT INTO tips (from_id, to_id, from_name, amount, ts, claimed) VALUES (?,?,?,?,?,1)').run(u.id, to.id, u.name, amt, now); } db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+      if (fail) return send(res, 400, { error: fail }); lastTip.set(u.id, now); return send(res, 200, { ok: true, to: to.name, amount: amt });
     }
     if (req.method === 'GET' && url.pathname === '/tips/incoming') {
       const u = authUser(req); if (!u) return send(res, 401, { error: 'not signed in' });
@@ -215,20 +225,6 @@ const server = http.createServer(async (req, res) => {
       if (!cfg.adminToken || req.headers.authorization !== 'Bearer ' + cfg.adminToken) return send(res, 401, { error: 'unauthorized' }); let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       const t = db.prepare('SELECT id FROM users WHERE name = ? COLLATE NOCASE').get(String(b.name || '')); if (!t) return send(res, 404, { error: 'no such player' });
       db.prepare('INSERT OR REPLACE INTO mutes (user_id, until) VALUES (?,?)').run(t.id, Date.now() + Math.max(1, +b.minutes || 60) * 60000); return send(res, 200, { ok: true });
-    }
-    if (req.method === 'GET' && url.pathname === '/feed') {                                            // everyone's recent rounds, newest first (public)
-      return send(res, 200, { rounds: db.prepare('SELECT id, name, game, stake, mult, payout, ts FROM feed ORDER BY id DESC LIMIT 40').all() });
-    }
-    if (req.method === 'POST' && url.pathname === '/feed') {                                           // a signed-in player reports a finished round
-      const u = authUser(req); if (!u) return send(res, 401, { error: 'not signed in' });
-      let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
-      const game = String(b.game || '').trim(), stake = +b.stake, payout = +b.payout;
-      if (!/^[A-Za-z0-9 \-]{1,24}$/.test(game)) return send(res, 400, { error: 'bad game' });
-      if (!(stake >= 0.01) || stake > 10000 || !(payout >= 0) || payout > 50000) return send(res, 400, { error: 'bad amounts' });
-      const now = Date.now(); if (now - (lastFeed.get(u.id) || 0) < 300) return send(res, 429, { error: 'slow down' }); lastFeed.set(u.id, now);
-      const mult = Math.round(payout / stake * 100) / 100;
-      const r = db.prepare('INSERT INTO feed (user_id, name, game, stake, mult, payout, ts) VALUES (?,?,?,?,?,?,?)').run(u.id, u.name, game, Math.round(stake * 100) / 100, mult, Math.round(payout * 100) / 100, now);
-      db.prepare('DELETE FROM feed WHERE id <= ?').run(Number(r.lastInsertRowid) - 500); return send(res, 200, { ok: true });
     }
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, provider: cfg.provider });
     if (req.method === 'POST' && url.pathname === '/auth/signup') {
@@ -255,6 +251,7 @@ const server = http.createServer(async (req, res) => {
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       const u = U.byEmail.get(String(b.email || '').trim().toLowerCase()), salt = u ? u.pass_salt : 'x'.repeat(32), hash = await scrypt(String(b.password || ''), salt);   // always hash: same timing for unknown emails
       if (!u || !u.pass_hash || hash.length !== u.pass_hash.length || !crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(u.pass_hash))) return send(res, 401, { error: 'wrong email or password' });
+      if (u.banned) return send(res, 403, { error: 'this account has been suspended' });
       return send(res, 200, { token: startSession(u.id), user: pubUser(u) });
     }
     if (req.method === 'POST' && url.pathname === '/auth/verify') {
