@@ -152,6 +152,7 @@ CREATE INDEX IF NOT EXISTS sp_l_b ON sp_legs(bet_id); CREATE INDEX IF NOT EXISTS
   async function sync() { if (mode === 'off') return; try { if (mode === 'live') await (PROV === 'toa' ? syncToa() : syncLive()); else syncDemo(); STATE.last = Date.now(); STATE.err = ''; } catch (e) { STATE.err = String(e.message || e).slice(0, 120); console.warn('sports sync:', STATE.err); } await settleDue(); }
   if (mode !== 'off' && E.SPORTS_SYNC !== 'off') { setTimeout(sync, 3000).unref(); setInterval(sync, mode === 'live' ? (PROV === 'toa' ? SYNC_MIN : 10) * 60000 : 60000).unref(); if (mode === 'live' && PROV === 'toa') setInterval(() => settleDue().catch(() => {}), 15 * 60000).unref(); }
   db.prepare("DELETE FROM sp_events WHERE start < ? AND id NOT IN (SELECT event_id FROM sp_legs)").run(Date.now() - 3 * 864e5);
+  if (mode !== 'demo') db.prepare("DELETE FROM sp_events WHERE id LIKE 'demo:%' AND id NOT IN (SELECT event_id FROM sp_legs)").run();      // fake demo fixtures never show next to real matches
 
   // ---------- public views ----------
   const pubEv = e => ({ id: e.id, sport: e.sport, league: e.league, home: e.home, away: e.away, start: e.start, status: e.status, hs: e.hs, as: e.aws, odds: e.odds ? JSON.parse(e.odds) : null, bettable: canBet(e) });
@@ -200,7 +201,7 @@ CREATE INDEX IF NOT EXISTS sp_l_b ON sp_legs(bet_id); CREATE INDEX IF NOT EXISTS
       if (req.method === 'GET' && P === '/sports/status') return send(res, 200, { mode, liveBets: LIVE_BETS, updated: STATE.last, min: MIN_STAKE_C / 100, max: MAX_STAKE_C / 100, maxLegs: MAX_LEGS, maxOdds: MAX_ODDS }), true;
       if (req.method === 'GET' && P === '/sports/events') { if (mode === 'off') return send(res, 200, { mode, events: [] }), true;
         const sport = url.searchParams.get('sport') === 'cs2' ? 'cs2' : 'football', st = url.searchParams.get('status') === 'live' ? 'live' : 'pending', now = Date.now();
-        const rows = db.prepare('SELECT * FROM sp_events WHERE sport=? AND status=? AND start < ? ' + (st === 'pending' ? 'AND start > ?' : 'AND start > ?') + ' ORDER BY start LIMIT 200').all(sport, st, now + 4 * 864e5, st === 'pending' ? now - 6e4 : now - 6 * 36e5).filter(e => e.odds || st === 'live');
+        const rows = db.prepare('SELECT * FROM sp_events WHERE sport=? AND status=? AND start < ? ' + (mode === 'demo' ? '' : "AND id NOT LIKE 'demo:%' ") + (st === 'pending' ? 'AND start > ?' : 'AND start > ?') + ' ORDER BY start LIMIT 200').all(sport, st, now + 4 * 864e5, st === 'pending' ? now - 6e4 : now - 6 * 36e5).filter(e => e.odds || st === 'live');
         return send(res, 200, { mode, events: rows.map(pubEv) }), true; }
       if (req.method === 'GET' && P === '/sports/event') { const e = db.prepare('SELECT * FROM sp_events WHERE id=?').get(String(url.searchParams.get('id') || '')); return e ? send(res, 200, { mode, event: pubEv(e) }) : send(res, 404, { error: 'not found' }), true; }
       if (P === '/sports/bet' || P === '/sports/my') { const u = authUser(req); if (!u) return send(res, 401, { error: 'not signed in' }), true;
