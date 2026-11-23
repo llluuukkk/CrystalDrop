@@ -88,6 +88,9 @@ function creditDeposit(d) {
   try { const r = q.credit.run(d.user_id, d.amount_cr, 'crypto deposit ' + d.coin, 'dep:' + d.id, Date.now()); if (r.changes) { q.mark.run(Date.now(), d.id); const c = Math.round(d.amount_cr * 100); db.prepare('UPDATE users SET bal_c = bal_c + ?, lock_c = lock_c + ? WHERE id=?').run(c, c, d.user_id); } db.exec('COMMIT'); return !!r.changes; }
   catch (e) { db.exec('ROLLBACK'); throw e; }
 }
+// unpaid addresses are not "pending" for ever: once their window (plus a grace for late payments) has passed they are marked expired
+const sweepDeposits = () => { try { db.prepare("UPDATE deposits SET status='expired' WHERE status='pending' AND expires_at < ?").run(Date.now() - 6 * 3600e3); } catch (e) {} };
+sweepDeposits(); setInterval(sweepDeposits, 10 * 60000).unref();
 const MAP = { waiting: 'pending', confirming: 'confirming', confirmed: 'confirming', sending: 'confirming', partially_paid: 'partial', finished: 'credited', expired: 'expired', failed: 'expired', refunded: 'expired' };
 function applyStatus(d, raw, txid, paidCR) {
   const st = MAP[raw] || 'pending';
