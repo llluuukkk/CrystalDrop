@@ -351,7 +351,7 @@ const RZ = (() => { const Z = {}, add = (k, nums, pay) => { Z[k] = { nums, pay }
   for (let c = 0; c < 11; c++) add('sx' + c, [3 * c + 1, 3 * c + 2, 3 * c + 3, 3 * c + 4, 3 * c + 5, 3 * c + 6], 5);
   add('t1', [0, 1, 2], 11); add('t2', [0, 2, 3], 11); add('f4', [0, 1, 2, 3], 8); return Z; })();
 const cents = x => Math.round(x * 100) / 100;
-const Roulette = { lim: [0.01, 5000], total(p) { const b = p.bets; if (!b || typeof b !== 'object') throw err('Place a chip first'); let t = 0; for (const k of Object.keys(b)) { if (!RZ[k]) throw err('bad bet'); const a = +b[k]; if (!(a > 0) || !isNum(a)) throw err('bad amount'); t += a; } return cents(t); },
+const Roulette = { lim: [0.01, 5000], total(p) { const b = p.bets; if (!b || typeof b !== 'object') throw err('Place a chip first'); let t = 0; for (const k of Object.keys(b)) { if (!RZ[k]) throw err('bad amount'); const a = +b[k]; if (!(a > 0) || !isNum(a)) throw err('bad amount'); t += a; } return cents(t); },
   bet(d, p, stake) { const n = ri(d, 37); let P = 0; for (const k of Object.keys(p.bets)) if (RZ[k].nums.includes(n)) P += cents(+p.bets[k]) * (RZ[k].pay + 1);
     return { mult: cents(P) / stake, view: { n }, label: n + ' ' + (n === 0 ? 'green' : RED.has(n) ? 'red' : 'black') }; } };
 
@@ -379,7 +379,7 @@ const bacRes = (P, B) => { const pt = btot(P), bt = btot(B), win = pt > bt ? 'P'
   const pp = P[0].r === P[1].r, bp = B[0].r === B[1].r; r.PP = pp ? 12 : 0; r.BP = bp ? 12 : 0; r.EP = pp || bp ? 6 : 0;
   r.PF = (pp && P[0].s === P[1].s) || (bp && B[0].s === B[1].s) ? 26 : 0; r.PB = bonusRet(P, B); r.BB = bonusRet(B, P); return { r, win }; };
 const Baccarat = { lim: [0.01, 50000], total(p) { const b = p.bets; if (!b || typeof b !== 'object') throw err('Place a chip first'); let t = 0;
-    for (const k of Object.keys(b)) { if (!BKEYS.has(k)) throw err('bad bet'); const a = +b[k]; if (!(a > 0) || !isNum(a)) throw err('bad amount'); if (BSIDE.has(k) && a > 3000) throw err('Max side upgrade is 3,000.00'); if (k === 'T' && a > 10000) throw err('Tie max upgrade is 10,000.00'); t += a; } return cents(t); },
+    for (const k of Object.keys(b)) { if (!BKEYS.has(k)) throw err('bad amount'); const a = +b[k]; if (!(a > 0) || !isNum(a)) throw err('bad amount'); if (BSIDE.has(k) && a > 3000) throw err('Max side upgrade is 3,000.00'); if (k === 'T' && a > 10000) throw err('Tie max upgrade is 10,000.00'); t += a; } return cents(t); },
   bet(d, p, stake) { const sh = mkShoe(), dc = () => shoeDraw(sh, d), P = [dc(), dc()], B = [dc(), dc()];
     if (btot(P) < 8 && btot(B) < 8) { let p3 = null; if (btot(P) <= 5) { p3 = dc(); P.push(p3); }
       const bb = btot(B), v = p3 && bv(p3);

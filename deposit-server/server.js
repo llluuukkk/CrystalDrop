@@ -221,7 +221,7 @@ const server = http.createServer(async (req, res) => {
       const now = Date.now(); if (now - (lastTip.get(u.id) || 0) < 5000) return send(res, 429, { error: 'wait a few seconds between tips' });
       const day = db.prepare('SELECT COALESCE(SUM(amount),0) s FROM tips WHERE from_id=? AND ts > ?').get(u.id, now - 864e5).s; if (day + amt > TIP_DAY) return send(res, 400, { error: 'daily tip limit is ' + TIP_DAY + ' CR' });
       const c = Math.round(amt * 100); let fail = null; db.exec('BEGIN IMMEDIATE');
-      try { const w = db.prepare('SELECT bal_c, lock_c FROM users WHERE id=?').get(u.id); if (w.lock_c > 0) fail = 'Tipping is locked until you wager ' + (w.lock_c / 100).toFixed(2) + ' more CR.'; else if (w.bal_c < c) fail = 'Not enough CR.';
+      try { const w = db.prepare('SELECT bal_c, lock_c FROM users WHERE id=?').get(u.id); if (w.lock_c > 0) fail = 'Tipping is locked until you upgrade ' + (w.lock_c / 100).toFixed(2) + ' more CR.'; else if (w.bal_c < c) fail = 'Not enough CR.';
         else { db.prepare('UPDATE users SET bal_c = bal_c - ? WHERE id=?').run(c, u.id); db.prepare('UPDATE users SET bal_c = bal_c + ? WHERE id=?').run(c, to.id); db.prepare('INSERT INTO tips (from_id, to_id, from_name, amount, ts, claimed) VALUES (?,?,?,?,?,1)').run(u.id, to.id, u.name, amt, now); } db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
       if (fail) return send(res, 400, { error: fail }); lastTip.set(u.id, now); return send(res, 200, { ok: true, to: to.name, amount: amt });
     }
