@@ -93,6 +93,7 @@ function creditDeposit(d) {
 // unpaid addresses are not "pending" for ever: once their window (plus a grace for late payments) has passed they are marked expired
 const sweepDeposits = () => { try { db.prepare("UPDATE deposits SET status='expired' WHERE status='pending' AND expires_at < ?").run(Date.now() - 6 * 3600e3); } catch (e) {} };
 sweepDeposits(); setInterval(sweepDeposits, 10 * 60000).unref();
+const POLLED = new Map();
 const MAP = { waiting: 'pending', confirming: 'confirming', confirmed: 'confirming', sending: 'confirming', partially_paid: 'partial', finished: 'credited', expired: 'expired', failed: 'expired', refunded: 'expired' };
 function applyStatus(d, raw, txid, paidCR) {
   const st = MAP[raw] || 'pending';
@@ -436,8 +437,20 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { status: applyStatus(d, 'finished', 'demotrade_' + crypto.randomBytes(4).toString('hex')) });
     }
     if (req.method === 'GET' && (m = url.pathname.match(/^\/deposits\/([\w-]+)$/))) {
-      const au = authUser(req), d = q.get.get(m[1]); if (!au || !d || d.user_id !== au.id) return send(res, 404, { error: 'not found' });
+      let d = q.get.get(m[1]); const au = authUser(req); if (!au || !d || d.user_id !== au.id) return send(res, 404, { error: 'not found' });
       if (d.status === 'pending' && d.expires_at < Date.now() - 6 * 3600e3) { q.upd.run('expired', d.confirmations, null, d.raw_status, d.id); d.status = 'expired'; }   // keep a grace period: late payments can still arrive
+      if (cfg.provider === 'nowpayments' && d.provider_id && d.status !== 'credited' && d.status !== 'expired' && Date.now() - (POLLED.get(d.id) || 0) > 8000) {   // don't rely on the webhook alone: ask NOWPayments directly
+        POLLED.set(d.id, Date.now());
+        try {
+          const pr = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/payment/' + encodeURIComponent(d.provider_id), { headers: { 'x-api-key': cfg.apiKey }, signal: AbortSignal.timeout(12000) });
+          const pj = await pr.json().catch(() => ({}));
+          if (pr.ok && pj.payment_status) {
+            const paid = +pj.actually_paid_at_fiat > 0 ? +pj.actually_paid_at_fiat : (+pj.actually_paid > 0 ? +pj.actually_paid * (d.rate || 0) : 0);
+            applyStatus(d, pj.payment_status, pj.payin_hash || pj.payout_hash, paid);
+            d = q.get.get(d.id);
+          }
+        } catch (e) { /* provider unreachable: the webhook may still arrive */ }
+      }
       return send(res, 200, pub(d));
     }
     if (req.method === 'POST' && url.pathname === '/webhook/nowpayments') {
