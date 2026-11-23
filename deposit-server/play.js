@@ -107,8 +107,8 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
     if (demo) { const d = demoDraw(), r = g.start(d, p, stake), extra_c = toC(r.extra || 0), total = stake_c + extra_c;
       if (r.done) return { ...out(r, total, null, payFor(r, r.st, stake_c)), done: true };
       r.st._m = stake_c; const id = rnd32(12); demoSess.set(id, { game: gname, st: r.st, stake_c: total, ts: Date.now() }); return { ok: true, sid: id, view: r.view, stake: toCR(total) }; }
-    // finish an abandoned round of this game first (it pays out like a cash-out), then start the new one
-    db.prepare('SELECT id FROM sess WHERE user_id=? AND game=?').all(u.id, gname).forEach(x => settleOpen(u, x.id));
+    // a round the player left is kept (stake included) until they come back to it; they cannot start another of the same game meanwhile
+    if (db.prepare('SELECT 1 FROM sess WHERE user_id=? AND game=?').get(u.id, gname)) throw err('You have a round in progress. Reopen this game to continue it.');
     return tx(() => { const f = fairGet(u.id), n = f.n + 1, d = mkDraw(f.ss, f.cs, n, 0), r = g.start(d, p, stake), extra_c = toC(r.extra || 0), total = stake_c + extra_c;
       spend(u.id, total); db.prepare('UPDATE fair SET n=? WHERE user_id=?').run(n, u.id); const fp = pubFair(f, n);
       if (r.done) { const pay = payFor(r, r.st, stake_c); earn(u.id, pay); logRound(u, gname, total, pay, fp, r.label); return { ...out(r, total, fp, pay, u.id), done: true }; }
@@ -153,9 +153,10 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
       const fp = pubFair(f, n); logRound(u, 'Upgrader', S_c, r.win ? toC(T.price) : 0, fp, r.win ? 'Upgraded' : 'Lost'); return { ok: true, ch: r.ch, u: r.u, win: r.win, stake: S, got, fair: fp, ...wout(u.id), inv: skinsOf(u.id) }; }); }
 
   // close every open round of a player (pays out like a cash-out) before things that need a clean slate
-  const settleAll = u => { db.prepare('SELECT id FROM sess WHERE user_id=?').all(u.id).forEach(x => settleOpen(u, x.id)); };
+  const needNoOpen = u => { if (openCount(u.id) > 0) throw err('Finish your round in progress first.'); };   // rounds are never closed behind the player's back
   // ---------- janitor: close rounds left open ----------
-  const sweep = uid => { const out = []; db.prepare('SELECT id FROM sess WHERE user_id=? AND ts < ?').all(uid, Date.now() - 10 * 60000).forEach(x => { const r = settleOpen({ id: uid, name: (db.prepare('SELECT name FROM users WHERE id=?').get(uid) || {}).name }, x.id); if (r) out.push(r); }); return out; };
+  const OPEN_DAYS = +process.env.OPEN_ROUND_DAYS || 7;   // a round left open is kept this long, then cashed out for the player
+  const sweep = uid => { const out = []; db.prepare('SELECT id FROM sess WHERE user_id=? AND ts < ?').all(uid, Date.now() - OPEN_DAYS * 86400000).forEach(x => { const r = settleOpen({ id: uid, name: (db.prepare('SELECT name FROM users WHERE id=?').get(uid) || {}).name }, x.id); if (r) out.push(r); }); return out; };
 
   // ---------- routes ----------
   const body = async req => { try { return JSON.parse(await readBody(req) || '{}'); } catch (e) { throw err('bad json'); } };
@@ -174,18 +175,22 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
       if (GET && P === '/my/rounds') { const rows = db.prepare('SELECT id, game, stake_c, mult, payout_c, n, cs, sh, label, ts FROM rounds WHERE user_id=? ORDER BY id DESC LIMIT 300').all(u.id);
         return send(res, 200, { rounds: rows.map(r => ({ id: 'r' + r.id, game: r.game, stake: toCR(r.stake_c), mult: r.mult, payout: toCR(r.payout_c), t: r.ts, label: r.label, fair: { n: r.n, cs: r.cs, sh: r.sh } })) }), true; }
       if (GET && P === '/fair') return send(res, 200, { ok: true, ...fairPub(u.id) }), true;
-      if (POST && P === '/fair/seed') { const b = await body(req); settleAll(u);
+      if (POST && P === '/fair/seed') { const b = await body(req); needNoOpen(u);
         return send(res, 200, { ok: true, ...tx(() => { const f = fairGet(u.id), hist = JSON.parse(f.hist); hist.unshift({ ss: f.ss, sh: sha(f.ss), cs: f.cs, n: f.n, t: Date.now() }); const cs = typeof b.cs === 'string' && /^[\w-]{1,40}$/.test(b.cs) ? b.cs : rnd32(8);
           db.prepare('UPDATE fair SET ss=?, cs=?, n=0, hist=? WHERE user_id=?').run(rnd32(32), cs, JSON.stringify(hist.slice(0, 20)), u.id); return fairPub(u.id); }) }), true; }
       const b = POST ? await body(req) : {};
       if (POST && P === '/shop/buy') return send(res, 200, buy(u, b.ids)), true;
       if (POST && P === '/shop/sell') return send(res, 200, sell(u, b.uids)), true;
       if (POST && P === '/pool/load') return send(res, 200, load(u, b.uids)), true;
-      if (POST && P === '/pool/unload') { settleAll(u); return send(res, 200, unload(u)), true; }
+      if (POST && P === '/pool/unload') { needNoOpen(u); return send(res, 200, unload(u)), true; }
       if (POST && P === '/upgrader') return send(res, 200, upgrade(u, b, false)), true;
       if (POST && P === '/demo/upgrader') return send(res, 200, upgrade(null, b, true)), true;
+      if (GET && P === '/g/resume') {   // the round this player left open in a game, so the page can carry on with it
+        const gname = String(new URL(req.url, 'http://x').searchParams.get('game') || ''), g = GM.GAMES[gname], sr = db.prepare('SELECT * FROM sess WHERE user_id=? AND game=? ORDER BY ts DESC').get(u.id, gname);
+        if (!g || !g.resume || !sr) return send(res, 200, { ok: true, none: true }), true;
+        const st = JSON.parse(sr.st), rs = g.resume(st); return send(res, 200, { ok: true, sid: sr.id, stake: toCR(sr.stake_c), main: toCR(st._m || sr.stake_c), ...rs }), true; }
       let m;
-      if (POST && (m = /^\/g\/(demo\/)?(play|auto|start|act|cash)$/.exec(P))) { const kind = m[2], gname = String(b.game || '');
+      if (POST && (m = /^\/g\/(demo\/)?(play|auto|start|act|cash)$/.exec(P))) { const kind = m[2], gname = String(b.game || ''); if (gname === 'War' && kind !== 'act' && kind !== 'cash') return send(res, 400, { error: 'This game is not available' }), true;   // War is switched off
         if (kind === 'play') return send(res, 200, playOnce(u, gname, b.p, b.stake, demo, false)), true;
         if (kind === 'auto') return send(res, 200, playOnce(u, gname, b.p, b.stake, demo, true)), true;
         if (kind === 'start') return send(res, 200, startSess(u, gname, b.p, b.stake, demo)), true;

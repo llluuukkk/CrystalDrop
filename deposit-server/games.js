@@ -310,6 +310,7 @@ const upCat = UP_RAW.slice(UP_RAW.indexOf('`') + 1, UP_RAW.lastIndexOf('`')).spl
   .sort((a, b) => a.price - b.price).map((x, i) => ({ ...x, id: i }));
 const UPCAT = upCat;
 const ri = (d, n) => Math.floor(d() * n);
+const K = 0.98;   // house-edge factor: every payout (except Roulette and Blackjack) is scaled by this, so the edge is 2% of the stake bigger
 const SU = '♠♥♦♣';
 const err = m => { const e = new Error(m); e.user = true; return e; };
 const isNum = x => typeof x === 'number' && isFinite(x);
@@ -323,18 +324,18 @@ const isRed = c => c.s === '♥' || c.s === '♦';
 const Dice = { lim: [0.01, 10000], bet(d, p) {
   const t = +p.t, over = !!p.over; if (!isNum(t)) throw err('bad target');
   const ch = over ? 100 - t : t; if (!(ch >= 0.0099 - 1e-9) || ch > 98 + 1e-9) throw err('Win chance must be 0.0099% to 98%');
-  const m = Math.min(10000, 99 / ch), vi = ri(d, 1000000), v = vi / 10000, ti = Math.round(t * 10000), w = over ? vi >= ti : vi < ti;
+  const m = Math.min(10000, 99 * K / ch), vi = ri(d, 1000000), v = vi / 10000, ti = Math.round(t * 10000), w = over ? vi >= ti : vi < ti;
   return { mult: w ? m : 0, view: { v, w }, label: 'Rolled ' + v.toFixed(2) }; } };
 
 // ---- Limbo ----
 const Limbo = { lim: [0.01, 10000], bet(d, p) {
-  const T = Math.min(1e4, Math.max(1.01, +p.target || 1.01)), v = Math.min(1e4, Math.max(1, Math.floor(0.99 / d() * 100) / 100)), w = v >= T;
+  const T = Math.min(1e4, Math.max(1.01, +p.target || 1.01)), v = Math.min(1e4, Math.max(1, Math.floor(0.99 * K / d() * 100) / 100)), w = v >= T;
   return { mult: w ? T : 0, view: { v, w }, label: v.toFixed(2) + 'x' }; } };
 
 // ---- Coin Flip ----
 const Flip = { lim: [0.01, 10000], bet(d, p) {
   const pick = p.pick === 'T' ? 'T' : 'H', r = d() < .5 ? 'H' : 'T';
-  return { mult: r === pick ? 1.96 : 0, view: { r }, label: r === 'H' ? 'Heads' : 'Tails' }; } };
+  return { mult: r === pick ? 1.96 * K : 0, view: { r }, label: r === 'H' ? 'Heads' : 'Tails' }; } };
 
 // ---- Roulette ----
 const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
@@ -356,7 +357,7 @@ const Roulette = { lim: [0.01, 5000], total(p) { const b = p.bets; if (!b || typ
     return { mult: cents(P) / stake, view: { n }, label: n + ' ' + (n === 0 ? 'green' : RED.has(n) ? 'red' : 'black') }; } };
 
 // ---- Plinko ----
-const plTbl = (risk, R) => { const h = PLT[risk][R]; return h.concat((R % 2 === 0 ? h.slice(0, -1) : h).slice().reverse()); };
+const plTbl = (risk, R) => { const h = PLT[risk][R]; return h.concat((R % 2 === 0 ? h.slice(0, -1) : h).slice().reverse()).map(x => x * K); };
 const Plinko = { lim: [0.01, 1000], bet(d, p) {
   const risk = p.risk, R = +p.rows; if (!PLT[risk] || !PLT[risk][R]) throw err('bad plinko setup');
   const path = Array.from({ length: R }, () => d() < .5 ? -1 : 1), k = path.filter(x => x > 0).length, m = plTbl(risk, R)[k];
@@ -368,7 +369,7 @@ const Keno = { lim: [0.01, 10000], bet(d, p) {
   if (!Array.isArray(pk) || !pk.length || pk.length > 10 || new Set(pk).size !== pk.length || pk.some(x => !Number.isInteger(x) || x < 0 || x >= N)) throw err('Pick 1 to 10 numbers');
   const dr = []; while (dr.length < 10) { const v = ri(d, N); if (!dr.includes(v)) dr.push(v); }
   const hits = pk.filter(x => dr.includes(x)).length;
-  return { mult: KT[risk][pk.length - 1][hits] || 0, view: { draw: dr, hits }, label: hits + ' hits' }; } };
+  return { mult: (KT[risk][pk.length - 1][hits] || 0) * K, view: { draw: dr, hits }, label: hits + ' hits' }; } };
 
 // ---- Baccarat ----
 const bv = c => c.r >= 10 ? 0 : c.r, btot = a => a.reduce((x, c) => x + bv(c), 0) % 10;
@@ -388,7 +389,7 @@ const Baccarat = { lim: [0.01, 50000], total(p) { const b = p.bets; if (!b || ty
     return { mult: cents(pay) / stake, view: { P, B, win, r }, label: win === 'T' ? 'Tie' : (win === 'P' ? 'Player' : 'Banker') + ' wins' }; } };
 
 // ---- Mines (hidden board kept on the server) ----
-const mnMult = (N, n, k) => { let x = .96; for (let i = 0; i < k; i++) x *= (N - i) / (N - n - i); return x; };
+const mnMult = (N, n, k) => { let x = .96 * K; for (let i = 0; i < k; i++) x *= (N - i) / (N - n - i); return x; };
 const mnSetup = p => { const side = +p.side, n = +p.mines; if (!Number.isInteger(side) || side < 5 || side > 8) throw err('bad board'); const N = side * side; if (!Number.isInteger(n) || n < 1 || n > N - 1) throw err('bad mine count'); return { side, N, n }; };
 const mkMines = (d, N, n) => { const s = new Set(); while (s.size < n) s.add(ri(d, N)); return [...s]; };
 const Mines = { lim: [0.01, 6000],
@@ -404,7 +405,7 @@ const Mines = { lim: [0.01, 6000],
     return { mult: hit < 0 ? mnMult(N, n, K) : 0, label: hit < 0 ? K + ' gems found' : 'Hit a mine', view: { mines: ms, open: hit < 0 ? pk : pk.slice(0, hit + 1) } }; } };
 
 // ---- Hi-Lo ----
-const HL_EDGE = .96, hlStep = (c, hi) => HL_EDGE / ((hi ? 14 - c : c) / 13);
+const HL_EDGE = .96 * K, hlStep = (c, hi) => HL_EDGE / ((hi ? 14 - c : c) / 13);
 const hlCard = d => ({ r: 1 + ri(d, 13), s: SU[ri(d, 4)] });
 const HiLo = { lim: [0.01, 10000],
   start(d) { const c = hlCard(d); return { st: { cur: c, m: 1, sk: 0, g: 0 }, view: { cur: c, m: 1, sk: 0 } }; },
@@ -420,7 +421,7 @@ const HiLo = { lim: [0.01, 10000],
 
 // ---- Tower ----
 const TWD = [['Easy', 4, 1], ['Medium', 3, 1], ['Hard', 2, 1], ['Expert', 3, 2], ['Master', 4, 3]], TWR = 8;
-const twM = (c, bd, k) => Math.min(1000000, +(0.96 * Math.pow(c / (c - bd), k)).toFixed(2));
+const twM = (c, bd, k) => Math.min(1000000, +(0.96 * K * Math.pow(c / (c - bd), k)).toFixed(2));
 const mkTower = (d, C, BD) => Array.from({ length: TWR }, () => { const s = new Set(); while (s.size < BD) s.add(ri(d, C)); return [...s]; });
 const Tower = { lim: [0.01, 10000],
   start(d, p) { const di = +p.di; if (!Number.isInteger(di) || !TWD[di]) throw err('bad difficulty'); const [, C, BD] = TWD[di]; return { st: { di, C, BD, bad: mkTower(d, C, BD), row: 0, picks: [] }, view: { row: 0, C, BD } }; },
@@ -437,7 +438,7 @@ const Tower = { lim: [0.01, 10000],
 
 // ---- Duck Cross (Chicken) ----
 const CHD = [['Easy', 1, 24], ['Medium', 3, 22], ['Hard', 5, 20], ['Expert', 10, 15]];
-const chM = (bd, k) => { let p = 1; for (let i = 0; i < k; i++) p *= (25 - bd - i) / (25 - i); return .96 / p; };
+const chM = (bd, k) => { let p = 1; for (let i = 0; i < k; i++) p *= (25 - bd - i) / (25 - i); return .96 * K / p; };
 const Chicken = { lim: [0.01, 10000],
   start(d, p) { const di = +p.d; if (!CHD[di]) throw err('bad difficulty'); return { st: { di, k: 0 }, view: { k: 0 } }; },
   act(d, st) { const [, bd, SF] = CHD[st.di], i = st.k, safe = d() < (SF - i) / (25 - i);
@@ -514,7 +515,13 @@ const Blackjack = { lim: [0.01, 10000], needs: 'stake',
 const BJ = Blackjack;
 
 // ---- Upgrader ----
-const upChance = (S, T) => T > S && S > 0 ? Math.min(.95, .96 * S / T) : 0;
+const upChance = (S, T) => T > S && S > 0 ? Math.min(.95, .96 * K * S / T) : 0;
 const Upgrader = { roll(d, S, T) { const ch = upChance(S, T); if (!(ch >= .0001)) throw err('Win chance is too low. Pick a cheaper target.'); const u = d(); return { ch, u, win: u < ch }; } };
 
+// what a page needs to carry on with a round that was left open (hidden cards, mines and traps stay hidden)
+Mines.resume = st => ({ view: { open: st.open, N: st.N, n: st.n }, p: { side: st.side, mines: st.n } });
+HiLo.resume = st => ({ view: { cur: st.cur, m: st.m, sk: st.sk, g: st.g }, p: {} });
+Tower.resume = st => ({ view: { row: st.row, C: st.C, BD: st.BD, picks: st.picks }, p: { di: st.di } });
+Chicken.resume = st => ({ view: { k: st.k }, p: { d: st.di } });
+Blackjack.resume = G => ({ view: bjPub(G), p: {} });
 module.exports = { MAXPAY, UPCAT, Dice, Limbo, Flip, Roulette, Plinko, Keno, Baccarat, Mines, HiLo, Tower, Chicken, War, Blackjack, Upgrader, upChance, cents, plTbl, mnMult, twM, chM, hlStep, err, TWD, CHD, GAMES: { Dice, Limbo, 'Coin Flip': Flip, Roulette, Plinko, Keno, Baccarat, Mines, 'Hi-Lo': HiLo, Tower, 'Duck Cross': Chicken, War, Blackjack } };
