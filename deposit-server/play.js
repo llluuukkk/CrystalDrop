@@ -23,7 +23,13 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
   const toC = x => Math.round(+x * 100);
 
   // ---------- wallet ----------
+  try { db.exec('ALTER TABLE users ADD COLUMN rb_acc REAL NOT NULL DEFAULT 0'); } catch (e) {}
+  try { db.exec('ALTER TABLE users ADD COLUMN wag_c INTEGER NOT NULL DEFAULT 0'); db.exec('ALTER TABLE users ADD COLUMN nb INTEGER NOT NULL DEFAULT 0'); db.exec('UPDATE users SET wag_c=COALESCE((SELECT SUM(stake_c) FROM rounds WHERE user_id=users.id),0), nb=(SELECT COUNT(*) FROM rounds WHERE user_id=users.id)'); } catch (e) {}
+  try { db.exec('ALTER TABLE users ADD COLUMN rb_paid_c INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
+  const RB_SHARE = 0.04;   // rakeback: 4% of the house edge on every wager
   const W = uid => db.prepare('SELECT bal_c, pool_c, vault_c, lock_c FROM users WHERE id=?').get(uid);
+  const statsOf = uid => { const r = db.prepare('SELECT wag_c, nb FROM users WHERE id=?').get(uid) || { wag_c: 0, nb: 0 }; return { wagered: toCR(r.wag_c), bets: r.nb }; };
+  const rbOf = uid => { const r = db.prepare('SELECT rb_acc, rb_paid_c FROM users WHERE id=?').get(uid) || { rb_acc: 0, rb_paid_c: 0 }; return { pending: toCR(Math.floor(r.rb_acc + 1e-9)), total: toCR(r.rb_paid_c), share: RB_SHARE }; };
   const wout = uid => { const w = W(uid); return { bal: toCR(w.bal_c), pool: toCR(w.pool_c), vault: toCR(w.vault_c), lock: toCR(w.lock_c) }; };
   const skinsOf = uid => db.prepare('SELECT uid, item, price_c FROM skins WHERE user_id=? ORDER BY ts DESC, uid').all(uid).map(s => ({ uid: s.uid, id: s.item, price: toCR(s.price_c) }));
   const newUid = () => rnd32(8);
@@ -74,6 +80,8 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
   const logRound = (u, game, stake_c, payout_c, fair, label) => {
     const mult = stake_c ? Math.round(payout_c / stake_c * 100) / 100 : 0;
     db.prepare('INSERT INTO rounds (user_id,name,game,stake_c,payout_c,mult,n,cs,sh,label,ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(u.id, u.name, game, stake_c, payout_c, mult, fair.n, fair.cs, fair.sh, label || '', Date.now());
+    db.prepare('UPDATE users SET wag_c = wag_c + ?, nb = nb + 1 WHERE id=?').run(stake_c, u.id);
+    if (stake_c > 0) db.prepare('UPDATE users SET rb_acc = rb_acc + ? WHERE id=?').run(stake_c * (GM.EDGE[game] == null ? 0.03 : GM.EDGE[game]) * RB_SHARE, u.id);
     const last = db.prepare('SELECT id FROM rounds ORDER BY id DESC LIMIT 1').get(); if (last && last.id % 200 === 0) db.prepare('DELETE FROM rounds WHERE id < ?').run(last.id - 50000);
     return mult;
   };
@@ -164,16 +172,22 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
   async function route(req, res, url) {
     const P = url.pathname, GET = req.method === 'GET', POST = req.method === 'POST';
     if (GET && P === '/feed') return send(res, 200, { rounds: db.prepare('SELECT id, name, game, stake_c, mult, payout_c, ts FROM rounds ORDER BY id DESC LIMIT 40').all().map(r => ({ id: r.id, name: r.name, game: r.game, stake: toCR(r.stake_c), mult: r.mult, payout: toCR(r.payout_c), ts: r.ts })) }), true;
-    if (!(P === '/wallet' || P === '/my/rounds' || P === '/fair' || P === '/fair/seed' || P === '/shop/buy' || P === '/shop/sell' || P === '/pool/load' || P === '/pool/unload' || P.startsWith('/g/') || P === '/upgrader' || P === '/demo/upgrader' || P === '/catalog')) return false;
+    if (!(P === '/wallet' || P === '/rakeback/claim' || P === '/my/rounds' || P === '/fair' || P === '/fair/seed' || P === '/shop/buy' || P === '/shop/sell' || P === '/pool/load' || P === '/pool/unload' || P.startsWith('/g/') || P === '/upgrader' || P === '/demo/upgrader' || P === '/catalog')) return false;
     try {
       if (GET && P === '/catalog') return send(res, 200, { items: UPCAT.map(x => ({ id: x.id, price: x.price })), updated: PRICE.updated, live: PRICE.live }), true;
       const demo = P.startsWith('/g/demo/') || P === '/demo/upgrader';
       if (demo) { if (!allow('d:' + ip(req), 30, 80)) return send(res, 429, { error: 'slow down' }), true; }
       const u = demo ? null : authUser(req); if (!demo && !u) return send(res, 401, { error: 'sign in to play' }), true;
       if (u && !allow('u:' + u.id)) return send(res, 429, { error: 'slow down' }), true;
-      if (GET && P === '/wallet') { const settled = sweep(u.id); return send(res, 200, { ok: true, ...wout(u.id), inv: skinsOf(u.id), fair: { hash: fairPub(u.id).hash, cs: fairGet(u.id).cs, n: fairGet(u.id).n }, open: db.prepare('SELECT game FROM sess WHERE user_id=?').all(u.id).map(x => x.game), settled }), true; }
+      if (GET && P === '/wallet') { const settled = sweep(u.id); return send(res, 200, { ok: true, ...wout(u.id), inv: skinsOf(u.id), fair: { hash: fairPub(u.id).hash, cs: fairGet(u.id).cs, n: fairGet(u.id).n }, open: db.prepare('SELECT game FROM sess WHERE user_id=?').all(u.id).map(x => x.game), rakeback: rbOf(u.id), stats: statsOf(u.id), settled }), true; }
       if (GET && P === '/my/rounds') { const rows = db.prepare('SELECT id, game, stake_c, mult, payout_c, n, cs, sh, label, ts FROM rounds WHERE user_id=? ORDER BY id DESC LIMIT 300').all(u.id);
         return send(res, 200, { rounds: rows.map(r => ({ id: 'r' + r.id, game: r.game, stake: toCR(r.stake_c), mult: r.mult, payout: toCR(r.payout_c), t: r.ts, label: r.label, fair: { n: r.n, cs: r.cs, sh: r.sh } })) }), true; }
+      if (POST && P === '/rakeback/claim') return send(res, 200, tx(() => {
+        const r = db.prepare('SELECT rb_acc FROM users WHERE id=?').get(u.id), c = Math.floor((r ? r.rb_acc : 0) + 1e-9);
+        if (c < 1) throw err('No rakeback to claim yet.');
+        db.prepare('UPDATE users SET bal_c = bal_c + ?, rb_acc = rb_acc - ?, rb_paid_c = rb_paid_c + ? WHERE id=?').run(c, c, c, u.id);
+        db.prepare('INSERT INTO ledger (user_id,amount,reason,ref,created_at) VALUES (?,?,?,?,?)').run(u.id, toCR(c), 'rakeback', 'rb:' + u.id + ':' + Date.now(), Date.now());
+        return { ok: true, claimed: toCR(c), ...wout(u.id), rakeback: rbOf(u.id) }; })), true;
       if (GET && P === '/fair') return send(res, 200, { ok: true, ...fairPub(u.id) }), true;
       if (POST && P === '/fair/seed') { const b = await body(req); needNoOpen(u);
         return send(res, 200, { ok: true, ...tx(() => { const f = fairGet(u.id), hist = JSON.parse(f.hist); hist.unshift({ ss: f.ss, sh: sha(f.ss), cs: f.cs, n: f.n, t: Date.now() }); const cs = typeof b.cs === 'string' && /^[\w-]{1,40}$/.test(b.cs) ? b.cs : rnd32(8);

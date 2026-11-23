@@ -1,11 +1,27 @@
 'use strict';
 // Admin panel: GET /admin serves the page, POST /admin/api/* is the JSON API. Everything needs ADMIN_TOKEN (Bearer).
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions }) {
   db.exec(`CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, action TEXT, target TEXT, detail TEXT, ip TEXT);`);
   try { db.exec('ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
   try { db.exec('ALTER TABLE users ADD COLUMN ban_reason TEXT'); } catch (e) {}
+
+  // ---- backups: a consistent copy of the whole database, daily, plus on demand; download them so a wiped disk is never the end ----
+  const BK_DIR = process.env.BACKUP_DIR || path.join(path.dirname(cfg.db), 'backups'), BK_KEEP = Math.max(2, +process.env.BACKUP_KEEP || 14), BK_HOURS = Math.max(1, +process.env.BACKUP_HOURS || 24);
+  const bkList = () => { try { return fs.readdirSync(BK_DIR).filter(n => /^crystaldrop-[\w.-]+\.db$/.test(n)).sort().reverse().map(n => { const st = fs.statSync(path.join(BK_DIR, n)); return { name: n, size: st.size, ts: st.mtimeMs }; }); } catch (e) { return []; } };
+  function makeBackup() {
+    fs.mkdirSync(BK_DIR, { recursive: true });
+    const name = 'crystaldrop-' + new Date().toISOString().replace(/[:.]/g, '-') + '.db', file = path.join(BK_DIR, name);
+    db.exec("VACUUM INTO '" + file.replace(/'/g, "''") + "'");
+    bkList().slice(BK_KEEP).forEach(x => { try { fs.unlinkSync(path.join(BK_DIR, x.name)); } catch (e) {} });
+    return name;
+  }
+  const bkTick = () => { try { const l = bkList()[0]; if (!l || Date.now() - l.ts > BK_HOURS * 3600e3) { const n = makeBackup(); console.log('backup written', n); } } catch (e) { console.error('backup failed', e.message); } };
+  setTimeout(bkTick, 60e3).unref(); setInterval(bkTick, 15 * 60e3).unref();
+  if (!process.env.DB_FILE) console.warn('WARNING: DB_FILE is not set, so the database sits in the app folder and may be erased on every deploy. Attach a persistent disk and set DB_FILE (see README).');
 
   const fails = new Map();                                    // wrong-token attempts per IP: 10 per 15 min
   const ipOf = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',').pop().trim();
@@ -113,9 +129,11 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
         db.prepare("UPDATE withdrawals SET status='rejected', note=?, done_at=? WHERE id=?").run(why, Date.now(), id); db.prepare('UPDATE users SET bal_c = bal_c + ? WHERE id=?').run(w.amount_c, w.user_id);
         db.prepare('INSERT INTO ledger (user_id,amount,reason,ref,created_at) VALUES (?,?,?,?,?)').run(w.user_id, w.amount_c / 100, 'withdrawal rejected: ' + why, 'wdr:' + id, Date.now());
         audit(req, 'withdrawal rejected', w.user_id + ' ' + id, cr(w.amount_c) + ' CR returned: ' + why); return { ok: true }; }); },
+    backups() { const f = (() => { try { return db.prepare('PRAGMA page_count').get().page_count * db.prepare('PRAGMA page_size').get().page_size; } catch (e) { return 0; } })(); return { db: cfg.db, size: f, persistent: !!process.env.DB_FILE, dir: BK_DIR, keep: BK_KEEP, hours: BK_HOURS, files: bkList() }; },
+    backupNow(b, req) { const name = makeBackup(); audit(req, 'backup', name, ''); return { ok: true, name }; },
     log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
   };
-  const ROUTES = { overview: API.overview, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
+  const ROUTES = { overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
 
   async function route(req, res, url) {
     const P = url.pathname;
@@ -123,6 +141,13 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'X-Robots-Tag': 'noindex, nofollow',
         'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" });
       res.end(PAGE); return true;
+    }
+    if (req.method === 'GET' && P === '/admin/backup') {   // download a backup file (Bearer token, like everything else here)
+      if (!gate(req, res)) return true;
+      const n = String(url.searchParams.get('name') || ''), f = bkList().find(x => x.name === n);
+      if (!f) { send(res, 404, { error: 'no such backup' }); return true; }
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': f.size, 'Content-Disposition': 'attachment; filename="' + f.name + '"', 'Cache-Control': 'no-store' });
+      fs.createReadStream(path.join(BK_DIR, f.name)).pipe(res); return true;
     }
     const m = /^\/admin\/api\/([\w/]+)$/.exec(P); if (!m || req.method !== 'POST' || !ROUTES[m[1]]) return false;
     if (!gate(req, res)) return true;
@@ -163,7 +188,7 @@ function signout(){TOKEN='';try{sessionStorage.removeItem('cd_admin')}catch(e){}
 $('#out').onclick=signout;
 $('#go').onclick=async()=>{TOKEN=$('#tok').value.trim();$('#lerr').textContent='';try{await api('overview');try{sessionStorage.setItem('cd_admin',TOKEN)}catch(e){}start()}catch(e){$('#lerr').textContent=e.message}};
 $('#tok').addEventListener('keydown',e=>{if(e.key==='Enter')$('#go').click()});
-const TABS=['Overview','Players','Rounds','Deposits','Withdrawals','Sports','Chat','Prices','Log'];let tab='Overview';
+const TABS=['Overview','Players','Rounds','Deposits','Withdrawals','Sports','Chat','Prices','Backups','Log'];let tab='Overview';
 function start(){$('#login').hidden=true;$('#app').hidden=false;const nav=$('#nav');nav.replaceChildren(...TABS.map(t=>E('button',{cls:t===tab?'on':'',on:{click:()=>{tab=t;start()}}},t)));VIEW[tab]().catch(e=>toast(e.message,1))}
 const tbl=(heads,rows,onrow)=>E('div',{cls:'wrap'},E('table',null,E('thead',null,E('tr',null,heads.map(h=>E('th',{cls:h.n?'n':''},h.t||h)))),E('tbody',null,rows.map(r=>{const tr=E('tr',onrow?{cls:'click',on:{click:()=>onrow(r)}}:null,r.cells.map((c,i)=>E('td',{cls:heads[i]&&heads[i].n?'n':''},c)));return tr}))));
 const K=(l,v,c)=>E('div',{cls:'k'},E('small',null,l),E('b',{cls:c||''},v));
@@ -199,6 +224,13 @@ async Chat(){const r=await api('chat',{limit:100});show(tbl(['Player','Message',
 async Prices(){const q=E('input',{placeholder:'search skin'}),out=E('div'),run=async()=>{const r=await api('prices',{q:q.value});const s=r.status;out.replaceChildren(E('div',{cls:'grid'},K('Last refresh',s.updated?dt(s.updated):'never',s.updated?'g':'y'),K('Skins priced live',s.live+' / '+r.total),K('Prices moved from base',r.moved),K('Last error',s.err||'none',s.err?'r':'g')),
   tbl(['Skin',{t:'Base',n:1},{t:'Now',n:1},{t:'Change',n:1}],r.items.map(x=>({cells:[x.name,fmt(x.base),fmt(x.price),((x.price/x.base-1)*100).toFixed(1)+'%']}))))};
  q.addEventListener('keydown',e=>{if(e.key==='Enter')run()});show(E('div',{cls:'row'},q,E('button',{cls:'b',on:{click:run}},'Search'),E('button',{cls:'b pri',on:{click:async e=>{e.target.disabled=true;try{await api('prices/refresh');toast('Prices refreshed')}catch(x){toast(x.message,1)}e.target.disabled=false;run()}}},'Refresh prices now')),out);await run()},
+async Backups(){const r=await api('backups');const mb=n=>(n/1048576).toFixed(2)+' MB';
+ const dl=async n=>{const x=await fetch('/admin/backup?name='+encodeURIComponent(n),{headers:{Authorization:'Bearer '+TOKEN}});if(!x.ok){alert('download failed');return}const a=E('a',{href:URL.createObjectURL(await x.blob()),download:n});document.body.append(a);a.click();a.remove()};
+ const now=E('button',{cls:'b pri',on:{click:async()=>{now.disabled=true;try{await api('backups/now')}catch(e){alert(e.message)}VIEW.Backups()}}},'Back up now');
+ show(E('div',{cls:'grid'},K('Database file',r.db),K('Size',mb(r.size)),K('Saved on a persistent disk',r.persistent?'yes':'NO - set DB_FILE',r.persistent?'g':'r'),K('Automatic backup',' every '+r.hours+' h, keep '+r.keep)),
+ r.persistent?E('span'):E('p',{style:'color:#fbbf24'},'The database is not on a persistent disk, so a deploy or restart can erase every balance. Attach a disk in Render and set DB_FILE (see the README), and download backups here regularly.'),
+ E('div',{cls:'row',style:'margin:12px 0'},now),E('p',{style:'opacity:.7'},'Backups stay on the same server disk. Download one now and then and keep it somewhere else.'),
+ tbl(['File',{t:'Size',n:1},'When',''],r.files.map(x=>({cells:[x.name,mb(x.size),dt(x.ts),E('button',{cls:'b',on:{click:e=>{e.stopPropagation();dl(x.name)}}},'Download')]}))))},
 async Log(){const r=await api('log',{limit:200});show(tbl(['When','Action','Target','Detail','IP'],r.log.map(x=>({cells:[dt(x.ts),x.action,x.target,x.detail,x.ip]}))))},
 };
 async function PLAYER(id){const r=await api('user',{id}),u=r.user,s=r.stats,amt=E('input',{placeholder:'+50 or -20',size:10}),why=E('input',{placeholder:'reason (required)',size:28}),mins=E('input',{placeholder:'minutes',size:7,value:'60'}),bwhy=E('input',{placeholder:'ban reason',size:24});

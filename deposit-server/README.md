@@ -49,3 +49,51 @@ Cloudflare's test key `1x00000000000000000000AA` (always passes) is for developm
   The receiver's page polls `GET /tips/incoming` and claims each tip once with `POST /tips/claim {ids}`.
 - Admin (Bearer `ADMIN_TOKEN`): `POST /admin/chat/delete {id}` and `POST /admin/mute {name, minutes}`.
 - The wager lock (1x of every CR bought before tipping) is enforced in the page, because balances and wagers are still kept in the browser. Move balances to the server before relying on it.
+
+## CS2 skin deposits
+
+The "Buy CR with CS2 skins" tab talks to `POST /skin-deposits` (create an offer), `GET /deposits/:id` (status) and, in demo mode only, `POST /skin-deposits/:id/simulate`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SKIN_PROVIDER` | `mock` while the payment provider is `mock`, otherwise `off` | `mock` = simulated trades (demo). `off` = the tab says "coming soon". Real Steam trade bots plug in behind the same routes. |
+| `SKIN_RATE` | `0.9` | CR credited per $1 of skin market value (0.5 to 1). |
+| `SKIN_TTL_MIN` | `15` | Minutes a trade offer stays valid. |
+| `SKIN_MAX_ITEMS` | `30` | Skins per offer. |
+| `SKIN_BOT_NAME` | `CrystalDropBot` | Name shown to players. |
+
+In `mock` mode the server trusts the skin prices the page sends, so it must never be used with real money. Real mode has to price skins on the server.
+
+## Admin panel
+Open `https://YOUR-SERVER/admin` and sign in with the `ADMIN_TOKEN` environment variable (set a long random value on Render, 32+ characters). Overview (what you owe players, house result, deposits), Players (search, balances, adjust CR with a mandatory reason, mute, ban), Rounds (per-game RTP), Deposits, Chat (delete), Prices (live feed status, refresh now) and an audit Log of every admin action. Ten wrong tokens from one IP lock that IP out for 15 minutes. Banning a player ends their sessions and blocks log-in.
+
+## Bot protection (Cloudflare Turnstile)
+1. Cloudflare dashboard, Turnstile, Add site: hostname `crystaldropgg.win`, widget type Managed. Copy the Site key and the Secret key.
+2. Render, Environment: `TURNSTILE_SECRET` = the secret key.
+3. Site: set the site key in index.html as `window.CD_TURNSTILE_KEY` (one line near the top), or run `localStorage.setItem('cd_turnstile_key','SITEKEY')` once to test.
+Sign-up, log-in and deposits then require a passed check (24 h pass per browser). Without the secret the server skips the check.
+
+## Sportsbook (soccer + CS2)
+Pre-match betting, singles and combos, markets: match result (1X2 for soccer, winner for CS2), total goals, both teams to score. The server settles from the final score (90 minutes for soccer, maps won for CS2); admin can settle or void any match by hand (Admin, Sports tab).
+- `ODDS_API_KEY` : your odds-api.io key. Without it a clearly labelled demo feed (made-up teams) runs, and only while payments are in mock mode.
+- `SPORTS_BOOK` : which bookmaker's prices to use (default Bet365, must be one selected on your odds-api.io plan).
+- `SPORTS_CUT` : share removed from every price above 1.00 (default 0.04).
+- `SPORTS_EXPOSURE` : most the house can owe on one match, in CR (default 20000).
+- `SPORTS_LIVE=on` : not used yet, live betting stays off.
+
+### Sports feed: The Odds API (default) or odds-api.io
+`ODDS_API_KEY` = your key. By default it is a key from the-odds-api.com (football only: 1X2 + totals; no CS2). Set `ODDS_PROVIDER=odds-api.io` to use odds-api.io instead (football + CS2).
+The Odds API free plan is 500 credits a month, so the server refreshes every `SPORTS_SYNC_MIN` minutes (default 360) for the leagues in `SPORTS_LEAGUES` (default `soccer_epl,soccer_spain_la_liga,soccer_uefa_champs_league`). Each league refresh costs 1 credit per market (`SPORTS_MARKETS`, default `h2h,totals`). Results use a scores call (2 credits) at most every `SPORTS_SCORES_MIN` minutes (default 180), and only while a bet is waiting for a result.
+
+
+## Keeping the database safe (do this on Render)
+
+The whole site (balances, rounds, withdrawals, users) lives in one SQLite file. On Render the app folder is wiped on every deploy and restart, so the file must sit on a **persistent disk**:
+
+1. Render, your service, **Disks**, **Add Disk**: name `data`, mount path `/var/data`, 1 GB. (Disks need a paid instance type.)
+2. Environment: add `DB_FILE` = `/var/data/crystaldrop.db`. Backups then go to `/var/data/backups` automatically.
+3. Deploy. The admin page, **Backups** tab, should now say "Saved on a persistent disk: yes".
+
+The server writes a backup every 24 hours (`BACKUP_HOURS`), keeps the newest 14 (`BACKUP_KEEP`), and you can press **Back up now** or **Download** any backup in the admin page. Download one now and then and keep it somewhere other than the server.
+
+To restore: stop the service, put the downloaded file on the disk as `/var/data/crystaldrop.db`, start the service.

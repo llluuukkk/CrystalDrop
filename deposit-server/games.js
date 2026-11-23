@@ -357,7 +357,7 @@ const Roulette = { lim: [0.01, 5000], total(p) { const b = p.bets; if (!b || typ
     return { mult: cents(P) / stake, view: { n }, label: n + ' ' + (n === 0 ? 'green' : RED.has(n) ? 'red' : 'black') }; } };
 
 // ---- Plinko ----
-const plTbl = (risk, R) => { const h = PLT[risk][R]; return h.concat((R % 2 === 0 ? h.slice(0, -1) : h).slice().reverse()).map(x => x * K); };
+const plTbl = (risk, R) => { const h = PLT[risk][R]; return h.concat((R % 2 === 0 ? h.slice(0, -1) : h).slice().reverse()).map(x => x >= 1000 ? x : x * K); };
 const Plinko = { lim: [0.01, 1000], bet(d, p) {
   const risk = p.risk, R = +p.rows; if (!PLT[risk] || !PLT[risk][R]) throw err('bad plinko setup');
   const path = Array.from({ length: R }, () => d() < .5 ? -1 : 1), k = path.filter(x => x > 0).length, m = plTbl(risk, R)[k];
@@ -405,17 +405,17 @@ const Mines = { lim: [0.01, 6000],
     return { mult: hit < 0 ? mnMult(N, n, K) : 0, label: hit < 0 ? K + ' gems found' : 'Hit a mine', view: { mines: ms, open: hit < 0 ? pk : pk.slice(0, hit + 1) } }; } };
 
 // ---- Hi-Lo ----
-const HL_EDGE = .96 * K, hlStep = (c, hi) => HL_EDGE / ((hi ? 14 - c : c) / 13);
+const HL_EDGE = .96 * K, hlStep = (c, hi, g) => (g ? 1 : HL_EDGE) / ((hi ? 14 - c : c) / 13);
 const hlCard = d => ({ r: 1 + ri(d, 13), s: SU[ri(d, 4)] });
 const HiLo = { lim: [0.01, 10000],
-  start(d) { const c = hlCard(d); return { st: { cur: c, m: 1, sk: 0, g: 0 }, view: { cur: c, m: 1, sk: 0 } }; },
+  start(d) { const c = hlCard(d); return { st: { cur: c, m: 1, sk: 0, g: 0 }, view: { cur: c, m: 1, sk: 0, g: 0 } }; },
   act(d, st, a, stake) { const c = st.cur, k = a.k; if (k !== 'hi' && k !== 'lo' && k !== 'skip') throw err('bad move'); if (k === 'skip' && st.sk >= 10) throw err('No skips left');
     const n = hlCard(d); st.cur = n;
     if (k === 'skip') { st.sk++; return { view: { cur: n, prev: c, m: st.m, sk: st.sk, k } }; }
     const ok = k === 'hi' ? n.r >= c.r : n.r <= c.r; if (!ok) { st.m = 0; return { done: true, mult: 0, label: 'Wrong guess', view: { cur: n, prev: c, m: 0, sk: st.sk, k, ok: false } }; }
-    st.m = st.m * hlStep(c.r, k === 'hi'); st.g++;
+    st.m = st.m * hlStep(c.r, k === 'hi', st.g); st.g++;
     if (stake * st.m >= MAXPAY) return { done: true, mult: MAXPAY / stake, label: 'Max payout', view: { cur: n, prev: c, m: st.m, sk: st.sk, k, ok: true, max: true } };
-    return { view: { cur: n, prev: c, m: st.m, sk: st.sk, k, ok: true } }; },
+    return { view: { cur: n, prev: c, m: st.m, sk: st.sk, g: st.g, k, ok: true } }; },
   cash(d, st, stake) { return { done: true, mult: Math.min(st.m, MAXPAY / stake), label: 'Cashed out', view: { m: st.m } }; },
   abandon(d, st, stake) { return HiLo.cash(d, st, stake); } };
 
@@ -524,4 +524,7 @@ HiLo.resume = st => ({ view: { cur: st.cur, m: st.m, sk: st.sk, g: st.g }, p: {}
 Tower.resume = st => ({ view: { row: st.row, C: st.C, BD: st.BD, picks: st.picks }, p: { di: st.di } });
 Chicken.resume = st => ({ view: { k: st.k }, p: { d: st.di } });
 Blackjack.resume = G => ({ view: bjPub(G), p: {} });
-module.exports = { MAXPAY, UPCAT, Dice, Limbo, Flip, Roulette, Plinko, Keno, Baccarat, Mines, HiLo, Tower, Chicken, War, Blackjack, Upgrader, upChance, cents, plTbl, mnMult, twM, chM, hlStep, err, TWD, CHD, GAMES: { Dice, Limbo, 'Coin Flip': Flip, Roulette, Plinko, Keno, Baccarat, Mines, 'Hi-Lo': HiLo, Tower, 'Duck Cross': Chicken, War, Blackjack } };
+// approximate theoretical house edge per game (share of each stake the house keeps); rakeback pays back 4% of it on every wager
+const EDGE = { Dice: 1 - .99 * K, Limbo: 1 - .99 * K, 'Coin Flip': 1 - .98 * K, Plinko: .03, Keno: .03, Mines: 1 - .96 * K, Tower: 1 - .96 * K, 'Duck Cross': 1 - .96 * K, 'Hi-Lo': 1 - .96 * K, Roulette: .027, Blackjack: .005, Baccarat: .0124 };
+module.exports = {
+  EDGE, MAXPAY, UPCAT, Dice, Limbo, Flip, Roulette, Plinko, Keno, Baccarat, Mines, HiLo, Tower, Chicken, War, Blackjack, Upgrader, upChance, cents, plTbl, mnMult, twM, chM, hlStep, err, TWD, CHD, GAMES: { Dice, Limbo, 'Coin Flip': Flip, Roulette, Plinko, Keno, Baccarat, Mines, 'Hi-Lo': HiLo, Tower, 'Duck Cross': Chicken, War, Blackjack } };
