@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
   try { db.exec('ALTER TABLE users ADD COLUMN rb_paid_c INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
   const RB_SHARE = 0.04;   // rakeback: 4% of the house edge on every wager
   const W = uid => db.prepare('SELECT bal_c, pool_c, vault_c, lock_c FROM users WHERE id=?').get(uid);
-  const statsOf = uid => { const r = db.prepare('SELECT wag_c, nb FROM users WHERE id=?').get(uid) || { wag_c: 0, nb: 0 }; return { wagered: toCR(r.wag_c), bets: r.nb }; };
+  const statsOf = uid => { const r = db.prepare('SELECT wag_c, nb FROM users WHERE id=?').get(uid) || { wag_c: 0, nb: 0 }; const bt = db.prepare("SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE user_id=? AND ref LIKE 'dep:%'").get(uid).s; return { wagered: toCR(r.wag_c), bets: r.nb, bought: Math.round(bt * 100) / 100 }; };
   const rbOf = uid => { const r = db.prepare('SELECT rb_acc, rb_paid_c FROM users WHERE id=?').get(uid) || { rb_acc: 0, rb_paid_c: 0 }; return { pending: toCR(Math.floor(r.rb_acc + 1e-9)), total: toCR(r.rb_paid_c), share: RB_SHARE }; };
   const wout = uid => { const w = W(uid); return { bal: toCR(w.bal_c), pool: toCR(w.pool_c), vault: toCR(w.vault_c), lock: toCR(w.lock_c) }; };
   const skinsOf = uid => db.prepare('SELECT uid, item, price_c FROM skins WHERE user_id=? ORDER BY ts DESC, uid').all(uid).map(s => ({ uid: s.uid, id: s.item, price: toCR(s.price_c) }));
