@@ -27,8 +27,12 @@ const cfg = {
   email: { provider: E.EMAIL_PROVIDER || (E.RESEND_API_KEY ? 'resend' : 'console'), resendKey: E.RESEND_API_KEY || '', from: E.EMAIL_FROM || 'CrystalDrop <no-reply@example.com>' },
 };
 // coin + network (as the page sends them) -> NOWPayments pay_currency code. Verify against GET /v1/currencies for your account.
-const COINS = {   // deposits: Solana only
+const COINS = {   // deposits: the coins enabled in the NOWPayments dashboard (Settings > Coins)
   'SOL|Solana': { code: 'sol', conf: 32 },
+  'BTC|Bitcoin': { code: 'btc', conf: 2 },
+  'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12 },
+  'USDT|Ethereum (ERC-20)': { code: 'usdterc20', conf: 12 },
+  'USDC|Ethereum (ERC-20)': { code: 'usdc', conf: 12 },
 };
 if (cfg.provider === 'nowpayments' && (!cfg.apiKey || !cfg.ipnSecret || !cfg.publicUrl)) { console.error('NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET and PUBLIC_URL are required for the nowpayments provider.'); process.exit(1); }
 
