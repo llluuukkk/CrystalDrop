@@ -440,6 +440,11 @@ const server = http.createServer(async (req, res) => {
       if (d.status === 'pending' && d.expires_at < Date.now()) return send(res, 400, { error: 'this trade offer has expired' });
       return send(res, 200, { status: applyStatus(d, 'finished', 'demotrade_' + crypto.randomBytes(4).toString('hex')) });
     }
+    if (req.method === 'GET' && url.pathname === '/my/transactions') {                                 // the player's own credits/debits and paid deposits, so history survives a reload
+      const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in' });
+      const led = db.prepare('SELECT id, amount, reason, ref, created_at FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 300').all(au.id).map(r => ({ id: r.id, amount: r.amount, reason: r.reason, ref: r.ref, t: r.created_at }));
+      const dep = db.prepare("SELECT id, coin, network, amount_cr, crypto_amount, txid, created_at, credited_at FROM deposits WHERE user_id=? AND status='credited' ORDER BY COALESCE(credited_at, created_at) DESC LIMIT 100").all(au.id).map(r => ({ id: r.id, coin: r.coin, network: r.network, amount: r.amount_cr, cryptoAmount: r.crypto_amount, txid: r.txid || '', t: r.credited_at || r.created_at }));
+      return send(res, 200, { ledger: led, deposits: dep }); }
     if (req.method === 'GET' && (m = url.pathname.match(/^\/deposits\/([\w-]+)$/))) {
       let d = q.get.get(m[1]); const au = authUser(req); if (!au || !d || d.user_id !== au.id) return send(res, 404, { error: 'not found' });
       if (d.status === 'pending' && d.expires_at < Date.now() - 6 * 3600e3) { q.upd.run('expired', d.confirmations, null, d.raw_status, d.id); d.status = 'expired'; }   // keep a grace period: late payments can still arrive
