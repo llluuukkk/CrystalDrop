@@ -201,36 +201,8 @@ const server = http.createServer(async (req, res) => {
       try { const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ secret: E.TURNSTILE_SECRET, response: String(b.token || '') }) });
         const okc = !!(await r.json()).success; return send(res, 200, okc ? { ok: true, pass: humanPass() } : { ok: false }); } catch (e) { return send(res, 502, { ok: false, error: 'captcha service unreachable' }); }
     }
-    // ---- manual SOL withdrawals ----  A request takes the CR off the balance at once; an admin pays by hand and marks it paid, or rejects it and the CR comes back.
-    // Off unless WITHDRAWALS=on. CR bought but not yet played (lock_c) cannot be withdrawn.
-    const WD = { on: E.WITHDRAWALS === 'on', min: +E.WITHDRAW_MIN || 5, max: +E.WITHDRAW_MAX || 500, day: +E.WITHDRAW_DAILY || 2000 };
-    const wdPub = w => ({ id: w.id, amount: w.amount_c / 100, address: w.address, status: w.status, txid: w.txid || undefined, note: w.note || undefined, created: w.created_at, done: w.done_at || undefined });
-    if (req.method === 'GET' && url.pathname === '/withdrawals/config') return send(res, 200, { enabled: WD.on, min: WD.min, max: WD.max, daily: WD.day, coin: 'SOL', network: 'Solana' });
-    if (req.method === 'GET' && url.pathname === '/withdrawals') { const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in' });
-      const w = db.prepare('SELECT bal_c, lock_c FROM users WHERE id=?').get(au.id);
-      return send(res, 200, { enabled: WD.on, available: Math.max(0, w.bal_c - w.lock_c) / 100, items: db.prepare('SELECT * FROM withdrawals WHERE user_id=? ORDER BY created_at DESC LIMIT 30').all(au.id).map(wdPub) }); }
-    if (req.method === 'POST' && url.pathname === '/withdrawals') {
-      const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to withdraw' });
-      if (!pubUser(au).verified) return send(res, 403, { error: 'confirm your email address first' });
-      if (!WD.on) return send(res, 503, { error: 'withdrawals are not available yet' });
-      if (limited(ip)) return send(res, 429, { error: 'too many requests' });
-      let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
-      const addr = String(b.address || '').trim(), c = Math.round((+b.amountCR || 0) * 100);
-      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) return send(res, 400, { error: 'enter a valid Solana address' });
-      if (c < WD.min * 100 || c > WD.max * 100) return send(res, 400, { error: `amount must be between ${WD.min} and ${WD.max} CR` });
-      try { const id = 'wd_' + crypto.randomBytes(8).toString('hex');
-        PLAY.tx(() => { const u = db.prepare('SELECT bal_c, lock_c, banned FROM users WHERE id=?').get(au.id); if (!u || u.banned) throw new Error('account suspended');
-          const free = u.bal_c - u.lock_c; if (c > free) throw new Error(free > 0 ? 'you can withdraw up to ' + (free / 100).toFixed(2) + ' CR right now (CR you buy has to be played once first)' : 'nothing to withdraw yet: CR you buy has to be played once first');
-          const day = db.prepare("SELECT COALESCE(SUM(amount_c),0) s FROM withdrawals WHERE user_id=? AND status!='rejected' AND created_at>?").get(au.id, Date.now() - 864e5).s;
-          if (day + c > WD.day * 100) throw new Error('daily limit is ' + WD.day + ' CR, you have ' + (Math.max(0, WD.day * 100 - day) / 100).toFixed(2) + ' CR left today');
-          if (db.prepare("SELECT COUNT(*) n FROM withdrawals WHERE user_id=? AND status='pending'").get(au.id).n >= 3) throw new Error('you already have 3 withdrawals waiting, please wait for them to be paid');
-          db.prepare('UPDATE users SET bal_c = bal_c - ? WHERE id=?').run(c, au.id);
-          db.prepare('INSERT INTO withdrawals (id,user_id,coin,network,address,amount_c,status,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id, au.id, 'SOL', 'Solana', addr, c, 'pending', Date.now());
-          db.prepare('INSERT INTO ledger (user_id,amount,reason,ref,created_at) VALUES (?,?,?,?,?)').run(au.id, -c / 100, 'withdrawal requested', 'wd:' + id, Date.now()); });
-        log(id, 'withdrawal requested ' + (c / 100) + ' CR by ' + au.id);
-        return send(res, 200, { ok: true, id, amount: c / 100 });
-      } catch (e) { return send(res, 400, { error: e.message || 'could not create the withdrawal' }); }
-    }
+    // ---- withdrawals: removed. Players cannot withdraw; the endpoints answer 410. (The withdrawals table stays so old records are not lost.) ----
+    if (url.pathname === '/withdrawals' || url.pathname.startsWith('/withdrawals/')) return send(res, 410, { error: 'withdrawals are not available' });
     // ---- live chat and tips ----  Chat: 5 second gap per user, 200 characters, no links, muted users blocked. Tips: whole accounts by display name, claimed by the receiver's page.
     const lastMsg = (globalThis.__lastMsg = globalThis.__lastMsg || new Map()), lastTip = (globalThis.__lastTip = globalThis.__lastTip || new Map());
     const CHAT_GAP = +E.CHAT_GAP_MS || 5000, TIP_MIN = 1, TIP_MAX = +E.TIP_MAX || 1000, TIP_DAY = +E.TIP_DAY || 5000;
