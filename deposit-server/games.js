@@ -329,7 +329,7 @@ const Dice = { lim: [0.01, 10000], bet(d, p) {
 
 // ---- Limbo ----
 const Limbo = { lim: [0.01, 10000], bet(d, p) {
-  const T = Math.min(1e4, Math.max(1.01, +p.target || 1.01)), v = Math.min(1e4, Math.max(1, Math.floor(0.99 * K / d() * 100) / 100)), w = v >= T;
+  const T = Math.min(1e4, Math.max(1.1, +p.target || 1.1)), v = Math.min(1e4, Math.max(1, Math.floor(0.99 * K / d() * 100) / 100)), w = v >= T;
   return { mult: w ? T : 0, view: { v, w }, label: v.toFixed(2) + 'x' }; } };
 
 // ---- Coin Flip ----
@@ -457,7 +457,7 @@ const War = { lim: [0.01, 10000],
     const sh = mkShoe(), P = shoeDraw(sh, d), D = shoeDraw(sh, d), tie = vv(P) === vv(D); let side = 0;
     if (tie && tv > 0) side += tv * 11; if (tie && cv > 0 && isRed(P) === isRed(D)) side += cv * 21; side = cents(Math.min(MAXPAY, side));
     const extra = cents(tv + cv);
-    if (tie) return { extra, side, st: { sh, st: stake, P, D, side }, view: { P, D, tie: true, side } };
+    if (tie) return { extra, side, st: { sh, st: stake, P, D, wside: side }, view: { P, D, tie: true, side } };
     const w = vv(P) > vv(D); return { extra, side, done: true, mult: w ? 2 : 0, label: w ? 'You win' : 'Dealer wins', view: { P, D, tie: false, side, res: w ? 'win' : 'lose' } }; },
   cost(st, a) { return a.k === 'war' ? st.st : 0; },
   abandon(d, st) { return { done: true, mult: .5, label: 'Surrendered', view: { P: st.P, D: st.D, res: 'lose', sur: true } }; },

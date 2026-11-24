@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS sess (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gam
   // ---------- stateful ----------
   // what a finished round pays, in cents: blackjack pays its own totals, war adds its side bet win, the rest pay stake x multiplier
   const payFor = (r, st, main_c) => { if (r.payTotal != null) return toC(r.payTotal) + toC(r.payoutExtra || 0);
-    return payC(r.bf ? main_c * r.bf : main_c, r.mult) + toC((st && st.side) || 0); };
+    return payC(r.bf ? main_c * r.bf : main_c, r.mult) + toC((st && st.wside) || 0); };
   const finish = (u, gname, sid, sr, st, r, stake_c, fp) => { const pay = payFor(r, st, st._m); earn(u.id, pay); db.prepare('DELETE FROM sess WHERE id=?').run(sid); logRound(u, gname, stake_c, pay, fp, r.label); return pay; };
   function startSess(u, gname, p, rawStake, demo) {
     const g = GM.GAMES[gname]; if (!g || !g.start) throw err('unknown game'); p = p || {}; const stake = +rawStake, stake_c = stakeCheck(g, stake);
