@@ -30,7 +30,7 @@ const cfg = {
 };
 // coin + network (as the page sends them) -> NOWPayments pay_currency code. Verify against GET /v1/currencies for your account.
 const COINS = {   // deposits. code = NOWPayments pay_currency; pg = PayGate.to ticker, a = which of YOUR wallets it pays into, cg/bn = price sources, pc = confirmations PayGate waits for
-  'SOL|Solana': { code: 'sol', conf: 32, pg: 'sol', a: 'sol', cg: 'solana', bn: 'SOLUSDT', sym: 'SOL', kr: 'SOLUSD', pc: 1, dec: 6 },
+  'SOL|Solana': { code: 'sol', conf: 32, pg: 'sol/sol', a: 'sol', cg: 'solana', bn: 'SOLUSDT', sym: 'SOL', kr: 'SOLUSD', pc: 1, dec: 6 },
   'BTC|Bitcoin': { code: 'btc', conf: 2, pg: 'btc', a: 'btc', cg: 'bitcoin', bn: 'BTCUSDT', sym: 'BTC', kr: 'XBTUSD', pc: 2, dec: 8 },
   'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12, pg: 'eth', a: 'evm', cg: 'ethereum', bn: 'ETHUSDT', sym: 'ETH', kr: 'ETHUSD', pc: 12, dec: 8 },
   'USDT|Ethereum (ERC-20)': { code: 'usdterc20', conf: 12, pg: 'erc20/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
@@ -190,7 +190,7 @@ const providers = {
     const price = await usdPrice(coin), f = Math.pow(10, coin.dec), cryptoAmount = Math.ceil(d.amount_cr / price * f) / f;
     const cb = cfg.publicUrl + '/webhook/paygate?d=' + d.id + '&k=' + pgKey(d.id);
     const r = await fetch('https://api.paygate.to/crypto/' + coin.pg + '/wallet.php?' + new URLSearchParams({ address: addr, callback: cb, pending: '0', confirmations: String(coin.pc) }), { signal: AbortSignal.timeout(20000) });
-    const j = await r.json().catch(() => ({})); if (!r.ok || !j.address_in) throw new Error('provider: ' + (j.error || j.message || r.status));
+    const raw = await r.text(); let j = {}; try { j = JSON.parse(raw); } catch (e) {} if (!r.ok || !j.address_in) { console.error('paygate wallet.php', coin.pg, 'HTTP', r.status, raw.slice(0, 300)); throw new Error('provider: ' + (j.error || j.message || r.status)); }
     return { providerId: 'pg_' + d.id, address: j.address_in, memo: '', cryptoAmount, rate: price };
   },
   async nowpayments(d, coin) {
