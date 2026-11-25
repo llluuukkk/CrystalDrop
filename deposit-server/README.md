@@ -97,3 +97,48 @@ The whole site (balances, rounds, withdrawals, users) lives in one SQLite file. 
 The server writes a backup every 24 hours (`BACKUP_HOURS`), keeps the newest 14 (`BACKUP_KEEP`), and you can press **Back up now** or **Download** any backup in the admin page. Download one now and then and keep it somewhere other than the server.
 
 To restore: stop the service, put the downloaded file on the disk as `/var/data/crystaldrop.db`, start the service.
+
+## Using PayGate.to instead of NOWPayments
+Set these on Render (Environment): `PROVIDER=paygate`, `PUBLIC_URL`, `PAYGATE_SECRET` (any long random text; it signs the callback links), and your own wallets:
+`PAYGATE_ADDR_BTC` (Bitcoin), `PAYGATE_ADDR_SOL` (Solana), `PAYGATE_ADDR_EVM` (one 0x address, used for ETH, USDT and USDC on Ethereum).
+PayGate forwards every payment straight to those wallets and then calls `/webhook/paygate`. The crypto callback is not signed by PayGate, so each callback link contains a secret key made from `PAYGATE_SECRET`; callbacks without it are rejected. Prices come from CoinGecko (Binance as backup). A coin whose wallet is not set cannot be deposited. Tests: `node --no-warnings test_paygate.js`.
+
+## Your own Steam trade bot (real CS2 skin deposits)
+
+How it works: `server.js` (web service) never talks to Steam. A second process, `bot.js` (a Render **Background Worker**), logs in to a Steam account that belongs only to the bot and polls the web server over HTTPS with `BOT_TOKEN`.
+
+1. The player pastes their trade URL and presses **Load my CS2 inventory**. The server queues an `inventory` job, the bot reads the (public) inventory, and the server prices every item from **Skinport** (cheapest listing, capped at the median; items nobody lists are hidden). The browser's prices are never used.
+2. The player picks skins and presses **Create trade offer**. The server queues a `trade` job; the bot sends an offer asking for those items with the message `CrystalDrop deposit CD-XXXX`.
+3. When the player accepts, the bot reports what it really received. The server values it again and credits: **instantly** while the player's skin deposits in the last 7 days stay at or below `SKIN_INSTANT_MAX` (100 CR), otherwise the deposit is **held** for `SKIN_HOLD_DAYS` (7) and credited automatically when the hold ends.
+4. The bot re-checks every accepted offer about every 10 minutes during the window. If Steam no longer reports it as accepted, the server takes the credit back (or cancels the hold). You can also do it by hand: Admin > Deposits > Reverse.
+
+Web service variables (on top of the existing ones):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOT_TOKEN` | none | Long random secret shared with the worker. Setting it turns real skin deposits on (`SKIN_PROVIDER` becomes `bot`). |
+| `SKIN_INSTANT_MAX` | `100` | CR a player can receive instantly per hold window. Above it the deposit is held. `0` holds everything. |
+| `SKIN_HOLD_DAYS` | `7` | Hold length. `0` credits everything instantly (not recommended). |
+| `SKIN_RATE` | `0.9` | CR per $1 of market value. |
+
+Worker (Render > New > Background Worker, same repo, root directory `deposit-server`, build command `npm install`, start command `node bot.js`):
+
+| Variable | Meaning |
+|---|---|
+| `API_URL` | `https://crystaldrop.onrender.com` |
+| `BOT_TOKEN` | exactly the same value as on the web service |
+| `STEAM_BOT_USER`, `STEAM_BOT_PASS` | login of the bot's Steam account |
+| `STEAM_SHARED_SECRET`, `STEAM_IDENTITY_SECRET` | from the bot account's mobile authenticator |
+| `OFFER_TTL_MIN` | minutes before an unaccepted offer is cancelled (default 20) |
+
+The bot account:
+- Use a **new Steam account made only for this**, never your own. It needs Steam Guard **mobile authenticator** enabled and must have spent at least $5 so trading is unlocked.
+- `shared_secret` and `identity_secret` come from the authenticator when it is set up (for example with the SteamDesktopAuthenticator tool). They are as sensitive as the password: put them only in Render's environment screen, **never paste them in a chat, an issue or a commit**.
+- Keep the account's own inventory for the bot only. Anyone who has these secrets can take every skin the bot holds, so move deposited skins out to a cold account on a schedule you set.
+
+What is and is not verified:
+- The server half (jobs, pricing, instant vs held credit, release after the hold, reversals, retries) and the bot loop are covered by `test_skinbot.js` and `test_bot.js` with a **fake Steam**. They cannot prove anything about real Steam.
+- The Steam adapter in `bot.js` (`steamAdapter`) has **not been run against real Steam** from here. The package calls follow the documented API of `steam-user` / `steam-tradeoffer-manager`, but expect to fix small things on the first real login. Watch the worker log on first start: it prints `steam: logged in`, `trade manager ready`, then one line per inventory read and offer.
+- Rollback detection is best effort: the bot treats any later state other than "accepted" as a reversal and logs the raw Steam state number (`REVERSED? ... raw=`). Check the first real one before trusting it, and use Admin > Reverse whenever you learn of a reversal some other way.
+- Steam's rules do not allow running a service that pays out money for items, and Valve has banned trading bots before. Expect that the bot account can be restricted or banned at any time.
+- A player who gets hijacked-account trades reversed after the hold is still your loss if the CR was already spent. The hold and the per-player instant limit only shrink that risk.

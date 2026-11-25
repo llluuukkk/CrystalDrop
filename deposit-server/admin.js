@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions }) {
+module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions, reverseSkin }) {
   db.exec(`CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, action TEXT, target TEXT, detail TEXT, ip TEXT);`);
   try { db.exec('ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
   try { db.exec('ALTER TABLE users ADD COLUMN ban_reason TEXT'); } catch (e) {}
@@ -91,6 +91,11 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
         db.prepare('INSERT INTO ledger (user_id, amount, reason, ref, created_at) VALUES (?,?,?,?,?)').run(u.id, amt / 100, 'admin: ' + why, 'adm:' + crypto.randomBytes(8).toString('hex'), Date.now());
         audit(req, amt > 0 ? 'credit' : 'debit', u.id + ' ' + u.name, (amt / 100) + ' CR: ' + why); return { ok: true, bal: cr(u.bal_c + amt) }; });
     },
+    skinReverse(b, req) {      // Steam rolled a skin trade back (or you found a fraud): take the credit out again / cancel the hold
+      const d = one("SELECT * FROM deposits WHERE id=? AND provider='skins'", String(b.id || '')); if (!d) throw Object.assign(new Error('no such skin deposit'), { code: 404 });
+      if (!['held', 'credited'].includes(d.status)) throw new Error('only held or credited skin deposits can be reversed (this one is ' + d.status + ')');
+      const st = reverseSkin(d, 'admin'); audit(req, 'skin-reverse', d.id, d.amount_cr + ' CR, user ' + d.user_id); return { ok: true, status: st };
+    },
     rounds(b) {
       const L = lim(b.limit, 50, 200), w = [], a = [];
       if (b.user) { w.push('user_id = ?'); a.push(String(b.user)); } if (b.game) { w.push('game = ?'); a.push(String(b.game)); }
@@ -100,7 +105,7 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
     },
     deposits(b) {
       const L = lim(b.limit, 50, 200), st = String(b.status || '');
-      return { deposits: all(`SELECT d.id, d.user_id, u.name, d.coin, d.network, d.amount_cr, d.status, d.txid, d.created_at, d.credited_at FROM deposits d LEFT JOIN users u ON u.id = d.user_id ${st === 'all' ? '' : st ? 'WHERE d.status = ?' : "WHERE d.status IN ('credited','confirming','partial')"} ORDER BY d.created_at DESC LIMIT ?`, ...(st && st !== 'all' ? [st] : []), L) };
+      return { deposits: all(`SELECT d.id, d.user_id, u.name, d.coin, d.network, d.amount_cr, d.status, d.txid, d.created_at, d.credited_at, d.hold_until, d.provider FROM deposits d LEFT JOIN users u ON u.id = d.user_id ${st === 'all' ? '' : st ? 'WHERE d.status = ?' : "WHERE d.status IN ('credited','confirming','partial','held')"} ORDER BY d.created_at DESC LIMIT ?`, ...(st && st !== 'all' ? [st] : []), L) };
     },
     chat(b) { return { chat: all('SELECT id, user_id, name, text, ts FROM chat ORDER BY id DESC LIMIT ?', lim(b.limit, 60, 200)) }; },
     chatDelete(b, req) { const n = db.prepare('DELETE FROM chat WHERE id=?').run(+b.id).changes; audit(req, 'chat delete', b.id, ''); return { deleted: n }; },
@@ -133,7 +138,7 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
     backupNow(b, req) { const name = makeBackup(); audit(req, 'backup', name, ''); return { ok: true, name }; },
     log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
   };
-  const ROUTES = { overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
+  const ROUTES = { skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
 
   async function route(req, res, url) {
     const P = url.pathname;
@@ -206,7 +211,7 @@ async Players(){const q=E('input',{placeholder:'name, email, id or steam id',val
 async Rounds(){const u=E('input',{placeholder:'user id (optional)'}),g=E('input',{placeholder:'game (optional)'}),mp=E('input',{placeholder:'min payout CR',size:12}),out=E('div'),
  run=async()=>{const r=await api('rounds',{user:u.value.trim(),game:g.value.trim(),minPayout:mp.value,limit:100});out.replaceChildren(E('h3',null,'Per game (all time)'),tbl(['Game',{t:'Rounds',n:1},{t:'Wagered',n:1},{t:'Paid',n:1},{t:'RTP %',n:1}],r.games.map(x=>({cells:[x.game,x.rounds,fmt(x.wagered),fmt(x.paid),x.rtp]}))),E('h3',{style:'margin-top:16px'},'Latest rounds'),tbl([{t:'#',n:1},'Player','Game',{t:'Stake',n:1},{t:'Payout',n:1},{t:'x',n:1},'Result','When'],r.rounds.map(x=>({id:x.uid,cells:[x.id,x.name,x.game,fmt(x.stake),fmt(x.payout),x.mult,x.label,dt(x.ts)]})),r=>PLAYER(r.id)))};
  show(E('div',{cls:'row'},u,g,mp,E('button',{cls:'b pri',on:{click:run}},'Filter')),out);await run()},
-async Deposits(){const s=E('select',null,[['','paid and confirming'],['partial','needs review'],['pending','unpaid'],['expired','expired'],['all','everything']].map(x=>E('option',{value:x[0]},x[1]))),out=E('div'),run=async()=>{const r=await api('deposits',{status:s.value,limit:100});out.replaceChildren(tbl(['Player','Coin',{t:'CR',n:1},'Status','Created','Credited'],r.deposits.map(d=>({id:d.user_id,cells:[d.name||d.user_id,d.coin+(d.network?' / '+d.network:''),fmt(d.amount_cr),d.status,dt(d.created_at),dt(d.credited_at)]})),r=>PLAYER(r.id)))};s.onchange=run;show(E('div',{cls:'row'},s),out);await run()},
+async Deposits(){const s=E('select',null,[['','paid, confirming and held'],['held','skins on hold'],['partial','needs review'],['pending','unpaid'],['expired','expired'],['all','everything']].map(x=>E('option',{value:x[0]},x[1]))),out=E('div'),run=async()=>{const r=await api('deposits',{status:s.value,limit:100});out.replaceChildren(tbl(['Player','Coin',{t:'CR',n:1},'Status','Created','Credited'],r.deposits.map(d=>({id:d.user_id,cells:[d.name||d.user_id,d.coin+(d.network?' / '+d.network:''),fmt(d.amount_cr),d.status+(d.status==='held'?' until '+dt(d.hold_until):''),dt(d.created_at),dt(d.credited_at),d.provider==='skins'&&(d.status==='held'||d.status==='credited')?E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();if(!confirm('Reverse this skin deposit? The CR is taken back out of the balance.'))return;try{await api('skinReverse',{id:d.id});run()}catch(x){alert(x.message)}}}},'Reverse'):''] })),r=>PLAYER(r.id)))};s.onchange=run;show(E('div',{cls:'row'},s),out);await run()},
 async Withdrawals(){const filt=E('select',null,[['pending','waiting to be paid'],['paid','paid'],['rejected','rejected'],['all','everything']].map(x=>E('option',{value:x[0]},x[1]))),out=E('div'),run=async()=>{const r=await api('withdrawals',{status:filt.value});
  out.replaceChildren(E('div',{cls:'grid'},K('Withdrawals',r.enabled?'ON':'off (set WITHDRAWALS=on)',r.enabled?'g':'y'),K('Waiting to be paid',r.pending.n,r.pending.n?'y':'g'),K('Waiting amount (CR)',fmt(r.pending.amount))),
  tbl(['Player',{t:'CR',n:1},'SOL address','Asked','Status',{t:'Deposited',n:1},{t:'Withdrawn',n:1},'Action'],r.items.map(w=>{const f=E('input',{placeholder:w.status==='pending'?'tx link, or reason to reject':'',size:22,value:w.txid||w.note||''});if(w.status!=='pending')f.disabled=true;

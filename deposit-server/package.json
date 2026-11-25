@@ -2,6 +2,17 @@
   "name": "crystaldrop-server",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": ">=22" },
-  "scripts": { "start": "node server.js" }
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "bot": "node bot.js"
+  },
+  "optionalDependencies": {
+    "steam-user": "^5.0.0",
+    "steamcommunity": "^3.48.0",
+    "steam-tradeoffer-manager": "^2.10.0",
+    "steam-totp": "^2.1.2"
+  }
 }
