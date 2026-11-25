@@ -36,8 +36,8 @@ function createBot({ api, token, adapter, pollMs = 3000, watchMs = 10 * 60e3, lo
   }
   async function runJob(j) {
     try {
-      if (j.type === 'inventory') { const items = await adapter.inventory(j.payload.steamid); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { items } }); log('inventory', j.payload.steamid, items.length, 'items'); }
-      else if (j.type === 'trade') { const p = j.payload, r = await adapter.sendOffer({ steamid: p.steamid, tradeUrl: p.tradeUrl, assetids: p.assetids, message: p.message, code: p.code }); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { offerId: String(r.offerId) } }); log('offer', r.offerId, p.code, p.assetids.length, 'items'); }
+      if (j.type === 'inventory') { const items = await adapter.inventory(j.payload.steamid, j.payload.appid || 730); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { items } }); log('inventory', j.payload.steamid, items.length, 'items'); }
+      else if (j.type === 'trade') { const p = j.payload, r = await adapter.sendOffer({ appid: p.appid || 730, steamid: p.steamid, tradeUrl: p.tradeUrl, assetids: p.assetids, message: p.message, code: p.code }); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { offerId: String(r.offerId) } }); log('offer', r.offerId, p.code, p.assetids.length, 'items'); }
       else await call('POST', '/bot/jobs/' + j.id, { ok: false, error: 'unknown job type' });
     } catch (e) { log('job failed', j.type, e && e.message); try { await call('POST', '/bot/jobs/' + j.id, { ok: false, error: friendly(e) }); } catch (_) {} }
   }
@@ -85,9 +85,9 @@ function steamAdapter(env = process.env) {
   const wear = it => { const t = (it.tags || []).find(x => x.category === 'Exterior'); return t ? (t.localized_tag_name || t.name || '') : ''; };
   return {
     ready: () => ready, onOffer: f => subs.push(f),
-    inventory: steamid => new Promise((res, rej) => manager.getUserInventoryContents(steamid, 730, 2, true, (e, inv) => e ? rej(e) : res(inv.filter(i => i.tradable && i.marketable).map(i => ({ assetid: String(i.assetid || i.id), name: i.market_hash_name, wear: wear(i), icon: i.icon_url || '' }))))),
-    sendOffer: ({ tradeUrl, assetids, message }) => new Promise((res, rej) => {
-      const offer = manager.createOffer(tradeUrl); offer.addTheirItems(assetids.map(a => ({ appid: 730, contextid: '2', assetid: String(a) }))); offer.setMessage(message);
+    inventory: (steamid, appid = 730) => new Promise((res, rej) => manager.getUserInventoryContents(steamid, appid, 2, true, (e, inv) => e ? rej(e) : res(inv.filter(i => i.tradable && i.marketable).map(i => ({ assetid: String(i.assetid || i.id), name: i.market_hash_name, wear: wear(i), icon: i.icon_url || '' }))))),
+    sendOffer: ({ tradeUrl, assetids, message, appid = 730 }) => new Promise((res, rej) => {
+      const offer = manager.createOffer(tradeUrl); offer.addTheirItems(assetids.map(a => ({ appid, contextid: '2', assetid: String(a) }))); offer.setMessage(message);
       offer.send((e, status) => e ? rej(e) : res({ offerId: offer.id, status }));
     }),
     offerState: id => new Promise((res, rej) => manager.getOffer(id, (e, offer) => e ? rej(e) : res({ state: name[offer.state] || 'unknown', raw: offer.state }))),

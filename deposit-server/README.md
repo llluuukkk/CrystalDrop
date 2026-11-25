@@ -119,7 +119,9 @@ Web service variables (on top of the existing ones):
 | `BOT_TOKEN` | none | Long random secret shared with the worker. Setting it turns real skin deposits on (`SKIN_PROVIDER` becomes `bot`). |
 | `SKIN_INSTANT_MAX` | `100` | CR a player can receive instantly per hold window. Above it the deposit is held. `0` holds everything. |
 | `SKIN_HOLD_DAYS` | `7` | Hold length. `0` credits everything instantly (not recommended). |
-| `SKIN_RATE` | `0.9` | CR per $1 of market value. |
+| `SKIN_RATE` | `0.9` | CR per $1 of CS2 market value. |
+| `SKIN_RATE_RUST` | `0.8` | CR per $1 of Rust market value (Rust skins trade thinner, so the default is lower). |
+| `SKIN_RUST` | on | Set to `0` to switch Rust deposits off. |
 
 Worker (Render > New > Background Worker, same repo, root directory `deposit-server`, build command `npm install`, start command `node bot.js`):
 
@@ -142,3 +144,5 @@ What is and is not verified:
 - Rollback detection is best effort: the bot treats any later state other than "accepted" as a reversal and logs the raw Steam state number (`REVERSED? ... raw=`). Check the first real one before trusting it, and use Admin > Reverse whenever you learn of a reversal some other way.
 - Steam's rules do not allow running a service that pays out money for items, and Valve has banned trading bots before. Expect that the bot account can be restricted or banned at any time.
 - A player who gets hijacked-account trades reversed after the hold is still your loss if the CR was already spent. The hold and the per-player instant limit only shrink that risk.
+
+Rust skins use the same bot and the same flow (Steam app 252490). Prices come from Skinport's Rust list. Check on the first real Rust deposit that Skinport returns prices for your items, and that the bot account can see Rust inventories (they must be public).

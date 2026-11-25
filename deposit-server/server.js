@@ -27,7 +27,9 @@ const cfg = {
   botToken: E.BOT_TOKEN || '',                                                    // shared secret between this server and the bot worker (bot.js)
   skinInstantMax: E.SKIN_INSTANT_MAX !== undefined && E.SKIN_INSTANT_MAX !== '' ? Math.max(0, +E.SKIN_INSTANT_MAX) : 100,   // CR a player may get instantly from skins (per player, per hold window); anything above is held
   skinHoldDays: E.SKIN_HOLD_DAYS !== undefined && E.SKIN_HOLD_DAYS !== '' ? Math.max(0, +E.SKIN_HOLD_DAYS) : 7,   // Steam can reverse a trade for about this long
-  skinRate: Math.min(1, Math.max(0.5, +E.SKIN_RATE || 0.9)),                    // CR credited per $1 of skin market value
+  skinRate: Math.min(1, Math.max(0.5, +E.SKIN_RATE || 0.9)),
+  skinRateRust: Math.min(1, Math.max(0.3, +E.SKIN_RATE_RUST || 0.8)),            // Rust skins are thinner on the market: a lower rate by default
+  rust: E.SKIN_RUST !== '0',                                                      // set SKIN_RUST=0 to switch Rust deposits off                    // CR credited per $1 of skin market value
   skinTtlMin: +E.SKIN_TTL_MIN || 15, skinMaxItems: +E.SKIN_MAX_ITEMS || 30, skinBot: E.SKIN_BOT_NAME || 'CrystalDropBot',
   email: { provider: E.EMAIL_PROVIDER || (E.RESEND_API_KEY ? 'resend' : 'console'), resendKey: E.RESEND_API_KEY || '', from: E.EMAIL_FROM || 'CrystalDrop <no-reply@example.com>' },
 };
@@ -128,17 +130,19 @@ let botSeen = 0;
 const botOnline = () => Date.now() - botSeen < 45000;
 const botAuth = req => { const a = String(req.headers.authorization || ''), w = 'Bearer ' + cfg.botToken; return !!cfg.botToken && a.length === w.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(w)); };
 const jsonOr = (t, d) => { try { return JSON.parse(t); } catch (e) { return d; } };
-let SP = { at: 0, map: null };                                                    // Skinport market prices (USD), refreshed every 15 min; the player's browser is never trusted for prices
-async function skinPrices() {
+const APPS = { cs2: 730, rust: 252490 }, gameOf = d => (d && d.network === 'Rust' ? 'rust' : 'cs2'), rateOf = g => g === 'rust' ? cfg.skinRateRust : cfg.skinRate;
+const SPC = {};                                                    // Skinport market prices (USD), refreshed every 15 min; the player's browser is never trusted for prices
+async function skinPrices(game = 'cs2') {
+  const SP = SPC[game] || (SPC[game] = { at: 0, map: null });
   if (SP.map && Date.now() - SP.at < 15 * 60e3) return SP.map;
   try {
-    const r = await fetch('https://api.skinport.com/v1/items?app_id=730&currency=USD', { headers: { 'Accept-Encoding': 'br, gzip', Accept: 'application/json', 'User-Agent': 'CrystalDrop/1.0' }, signal: AbortSignal.timeout(25000) });
+    const r = await fetch('https://api.skinport.com/v1/items?app_id=' + APPS[game] + '&currency=USD', { headers: { 'Accept-Encoding': 'br, gzip', Accept: 'application/json', 'User-Agent': 'CrystalDrop/1.0' }, signal: AbortSignal.timeout(25000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const arr = await r.json(), m = new Map();
     for (const it of Array.isArray(arr) ? arr : []) { const lo = +it.min_price, med = +it.median_price; if (!(lo > 0) || !it.market_hash_name) continue; m.set(it.market_hash_name, +(med > 0 ? Math.min(lo, med) : lo).toFixed(2)); }   // cheapest listing, never above the median: an item nobody lists is not priced at all
-    if (m.size < 50) throw new Error('price list too small (' + m.size + ')');
-    SP = { at: Date.now(), map: m };
-  } catch (e) { log(null, 'skinport prices failed: ' + e.message); }
+    if (m.size < (game === 'rust' ? 20 : 50)) throw new Error('price list too small (' + m.size + ')');
+    SP.at = Date.now(); SP.map = m;
+  } catch (e) { log(null, 'skinport prices failed (' + game + '): ' + e.message); }
   return SP.map && Date.now() - SP.at < 6 * 3600e3 ? SP.map : null;
 }
 const steamId64 = tu => { const m = String(tu).match(/partner=(\d{1,10})/); return m ? String(BigInt(m[1]) + 76561197960265728n) : null; };
@@ -146,7 +150,7 @@ const steamId64 = tu => { const m = String(tu).match(/partner=(\d{1,10})/); retu
 function finishSkin(d, got, oid) {
   if (['credited', 'held'].includes(d.status)) return d.status;
   const items = (Array.isArray(got) ? got : []).map(x => ({ assetid: String(x.assetid || ''), name: String(x.name || '').slice(0, 120), price: +x.price || 0 }));
-  const value = +items.reduce((a, x) => a + x.price, 0).toFixed(2), credit = Math.floor(value * cfg.skinRate * 100) / 100;
+  const value = +items.reduce((a, x) => a + x.price, 0).toFixed(2), credit = Math.floor(value * rateOf(gameOf(d)) * 100) / 100;
   if (!items.length || !(credit > 0)) { q.upd.run('expired', d.confirmations, null, 'accepted but nothing creditable', d.id); log(d.id, 'ACCEPTED BUT NOTHING CREDITABLE — check the bot inventory'); return 'expired'; }
   const used = db.prepare("SELECT COALESCE(SUM(amount_cr),0) s FROM deposits WHERE user_id=? AND provider='skins' AND status IN ('credited','held') AND (hold_until IS NULL OR status='held') AND created_at > ?").get(d.user_id, Date.now() - cfg.skinHoldDays * 86400e3).s;
   db.prepare('UPDATE deposits SET amount_cr=?, items=?, crypto_amount=? WHERE id=?').run(credit, JSON.stringify(items), items.length, d.id); d = { ...d, amount_cr: credit };
@@ -269,7 +273,7 @@ const humanOk = req => { if (!E.TURNSTILE_SECRET) return true; const m = /^(\d{1
 const send = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': cfg.allowOrigin, 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Human', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS' }); res.end(b); };
 const readBody = req => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) { no(new Error('too large')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); });
 const sortKeys = o => Array.isArray(o) ? o.map(sortKeys) : o && typeof o === 'object' ? Object.fromEntries(Object.keys(o).sort().map(k => [k, sortKeys(o[k])])) : o;
-const pub = d => ({ open: !!d.open, id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr, holdUntil: d.hold_until ? new Date(d.hold_until).toISOString() : undefined, trade: d.provider === 'skins' ? (String(d.raw_status || '').startsWith('sent') ? 'sent' : (d.raw_status || '')) : undefined });
+const pub = d => ({ open: !!d.open, id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr, holdUntil: d.hold_until ? new Date(d.hold_until).toISOString() : undefined, game: d.provider === 'skins' ? gameOf(d) : undefined, trade: d.provider === 'skins' ? (String(d.raw_status || '').startsWith('sent') ? 'sent' : (d.raw_status || '')) : undefined });
 
 const PLAY = require('./play.js')({ db, send, readBody, authUser, cfg });
 const SPORTS = require('./sports.js')({ db, send, readBody, authUser, cfg, PLAY });
@@ -474,7 +478,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { id: d.id, address: p.address, memo: p.memo, cryptoAmount: p.cryptoAmount, cryptoAmt: p.cryptoAmount, rate: p.rate, expiresAt: new Date(exp).toISOString(), confirmationsRequired: coin.conf, open, minCR: open ? d.amount_cr : undefined });
     }
     let m;
-    if (req.method === 'GET' && url.pathname === '/skin-deposits/config') return send(res, 200, { enabled: cfg.skins !== 'off', demo: cfg.skins === 'mock', real: cfg.skins === 'bot', online: cfg.skins === 'mock' || (cfg.skins === 'bot' && botOnline()), rate: cfg.skinRate, maxItems: cfg.skinMaxItems, min: cfg.min, max: cfg.max, ttlMin: cfg.skinTtlMin, bot: cfg.skinBot, instantMax: cfg.skinInstantMax, holdDays: cfg.skinHoldDays });
+    if (req.method === 'GET' && url.pathname === '/skin-deposits/config') return send(res, 200, { enabled: cfg.skins !== 'off', demo: cfg.skins === 'mock', real: cfg.skins === 'bot', online: cfg.skins === 'mock' || (cfg.skins === 'bot' && botOnline()), rate: cfg.skinRate, rates: { cs2: cfg.skinRate, rust: cfg.skinRateRust }, games: cfg.rust ? ['cs2', 'rust'] : ['cs2'], maxItems: cfg.skinMaxItems, min: cfg.min, max: cfg.max, ttlMin: cfg.skinTtlMin, bot: cfg.skinBot, instantMax: cfg.skinInstantMax, holdDays: cfg.skinHoldDays });
     if (cfg.skins === 'bot' && req.method === 'POST' && url.pathname === '/skin-deposits/inventory') {      // step 1: ask our bot to read the player's (public) CS2 inventory
       if (!humanOk(req)) return send(res, 403, { error: 'verification required, reload the page' });
       const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to deposit' });
@@ -483,20 +487,20 @@ const server = http.createServer(async (req, res) => {
       if (!botOnline()) return send(res, 503, { error: 'skin deposits are unavailable right now, try again in a few minutes' });
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       const tu = String(b.tradeUrl || '').trim(); if (!TRADE_URL.test(tu)) return send(res, 400, { error: 'enter your Steam trade URL (https://steamcommunity.com/tradeoffer/new/?partner=...&token=...)' });
-      const sid = steamId64(tu), recent = db.prepare("SELECT id FROM bot_jobs WHERE type='inventory' AND user_id=? AND created_at > ? AND status != 'failed' AND payload LIKE ? ORDER BY created_at DESC LIMIT 1").get(au.id, Date.now() - 60000, '%"steamid":"' + sid + '"%');
+      const game = b.game === 'rust' && cfg.rust ? 'rust' : 'cs2', sid = steamId64(tu), recent = db.prepare("SELECT id FROM bot_jobs WHERE type='inventory' AND user_id=? AND created_at > ? AND status != 'failed' AND payload LIKE ? ORDER BY created_at DESC LIMIT 1").get(au.id, Date.now() - 60000, '%"steamid":"' + sid + '","game":"' + game + '"%');
       if (recent) return send(res, 200, { invId: recent.id });
-      const id = 'inv_' + crypto.randomBytes(8).toString('hex'); db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run(id, 'inventory', au.id, JSON.stringify({ steamid: sid }), Date.now());
+      const id = 'inv_' + crypto.randomBytes(8).toString('hex'); db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run(id, 'inventory', au.id, JSON.stringify({ steamid: sid, game, appid: APPS[game] }), Date.now());
       return send(res, 200, { invId: id });
     }
     if (cfg.skins === 'bot' && req.method === 'GET' && (m = url.pathname.match(/^\/skin-deposits\/inventory\/([\w-]+)$/))) {   // step 2: poll until the bot has the list, then price it here
       const au = authUser(req), j = db.prepare("SELECT * FROM bot_jobs WHERE id=? AND type='inventory'").get(m[1]); if (!au || !j || j.user_id !== au.id) return send(res, 404, { error: 'not found' });
       if (j.status === 'queued' || j.status === 'taken') return send(res, 200, { status: 'pending' });
       const r = jsonOr(j.result, {}); if (j.status !== 'done') return send(res, 200, { status: 'failed', error: String(r.error || 'could not read the inventory').slice(0, 200) });
-      const P = await skinPrices(); if (!P) return send(res, 200, { status: 'failed', error: 'skin prices are unavailable right now, try again shortly' });
+      const game = jsonOr(j.payload, {}).game === 'rust' ? 'rust' : 'cs2', rate = rateOf(game), P = await skinPrices(game); if (!P) return send(res, 200, { status: 'failed', error: 'skin prices are unavailable right now, try again shortly' });
       let hidden = 0; const items = [];
-      for (const it of Array.isArray(r.items) ? r.items : []) { const pr = P.get(it.name); if (!(pr >= 0.03) || !it.assetid) { hidden++; continue; } items.push({ assetid: String(it.assetid), name: String(it.name).slice(0, 120), wear: String(it.wear || '').slice(0, 24), icon: /^[\w-]{20,400}$/.test(String(it.icon || '')) ? it.icon : '', price: pr, credit: Math.floor(pr * cfg.skinRate * 100) / 100 }); }
+      for (const it of Array.isArray(r.items) ? r.items : []) { const pr = P.get(it.name); if (!(pr >= 0.03) || !it.assetid) { hidden++; continue; } items.push({ assetid: String(it.assetid), name: String(it.name).slice(0, 120), wear: String(it.wear || '').slice(0, 24), icon: /^[\w-]{20,400}$/.test(String(it.icon || '')) ? it.icon : '', price: pr, credit: Math.floor(pr * rate * 100) / 100 }); }
       items.sort((a, b2) => b2.price - a.price);
-      return send(res, 200, { status: 'ready', items: items.slice(0, 400), hidden, rate: cfg.skinRate });
+      return send(res, 200, { status: 'ready', items: items.slice(0, 400), hidden, rate, game });
     }
     if (url.pathname.startsWith('/bot/')) {                                                                 // the bot worker (bot.js): authenticated with BOT_TOKEN
       if (!botAuth(req)) return send(res, 401, { error: 'unauthorized' });
@@ -524,7 +528,7 @@ const server = http.createServer(async (req, res) => {
         const st = String(b.state || ''), oid = String(b.offerId || '').replace(/\D/g, '').slice(0, 20);
         if (st === 'accepted') {
           if (d.status !== 'pending' && d.status !== 'expired') return send(res, 200, { ok: true, status: d.status });   // already handled (the bot may repeat itself)
-          const P = await skinPrices(); if (!P) return send(res, 503, { error: 'prices unavailable, retry' });     // bot retries later; nothing is lost
+          const P = await skinPrices(gameOf(d)); if (!P) return send(res, 503, { error: 'prices unavailable, retry' });     // bot retries later; nothing is lost
           const asked = new Map(jsonOr(d.items, []).map(i => [String(i.assetid), i])), got = [];
           for (const x of Array.isArray(b.items) ? b.items : []) { const pr = P.get(String(x.name || '')); if (pr >= 0.03) got.push({ assetid: String(x.assetid || ''), name: String(x.name), price: Math.min(pr, (asked.get(String(x.assetid)) || {}).price || pr) }); }   // never more than the price shown when the offer was made
           return send(res, 200, { ok: true, status: finishSkin(d, got, oid) });
@@ -547,20 +551,21 @@ const server = http.createServer(async (req, res) => {
         if (!botOnline()) return send(res, 503, { error: 'skin deposits are unavailable right now, try again in a few minutes' });
         const j = db.prepare("SELECT * FROM bot_jobs WHERE id=? AND type='inventory' AND status='done'").get(String(b.invId || '')); if (!j || j.user_id !== au.id || j.created_at < Date.now() - 20 * 60e3) return send(res, 400, { error: 'your inventory list expired, load it again' });
         const ids = [...new Set((Array.isArray(b.assetids) ? b.assetids : []).map(String))]; if (!ids.length || ids.length > cfg.skinMaxItems) return send(res, 400, { error: `choose 1 to ${cfg.skinMaxItems} skins` });
-        const P = await skinPrices(); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
+        const game = jsonOr(j.payload, {}).game === 'rust' ? 'rust' : 'cs2', rate = rateOf(game);
+        const P = await skinPrices(game); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
         const inv = new Map((jsonOr(j.result, {}).items || []).map(i => [String(i.assetid), i])), items = []; let value = 0;
         for (const id of ids) { const it = inv.get(id), pr = it && P.get(it.name); if (!it || !(pr >= 0.03)) return send(res, 400, { error: 'one of those skins can no longer be deposited, reload your inventory' }); items.push({ assetid: id, name: String(it.name).slice(0, 120), wear: String(it.wear || '').slice(0, 24), price: pr }); value += pr; }
-        value = +value.toFixed(2); const credit = Math.floor(value * cfg.skinRate * 100) / 100;
-        if (!(credit >= cfg.min && credit <= cfg.max)) return send(res, 400, { error: `the offer must be worth between ${cfg.min} and ${cfg.max} CR after the ${Math.round(cfg.skinRate * 100)}% rate` });
+        value = +value.toFixed(2); const credit = Math.floor(value * rate * 100) / 100;
+        if (!(credit >= cfg.min && credit <= cfg.max)) return send(res, 400, { error: `the offer must be worth between ${cfg.min} and ${cfg.max} CR after the ${Math.round(rate * 100)}% rate` });
         for (const o of db.prepare("SELECT items FROM deposits WHERE provider='skins' AND status='pending' AND expires_at > ?").all(Date.now())) if (jsonOr(o.items, []).some(i => ids.includes(String(i.assetid)))) return send(res, 400, { error: 'one of those skins is already in an open offer' });
         db.prepare("UPDATE deposits SET status='expired', raw_status='replaced' WHERE user_id=? AND provider='skins' AND status='pending'").run(au.id);   // one open offer per player
         const id = 'dep_' + crypto.randomBytes(8).toString('hex'), code = 'CD-' + Array.from(crypto.randomBytes(4), x => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[x % 31]).join(''), exp = Date.now() + Math.max(cfg.skinTtlMin, 15) * 60000;
-        q.ins.run(id, au.id, 'CS2', 'Steam trade', credit, items.length, cfg.skinRate, code, '', 'skins', 'skin_' + crypto.randomBytes(6).toString('hex'), 'pending', 1, Date.now(), exp);
+        q.ins.run(id, au.id, 'CS2', game === 'rust' ? 'Rust' : 'Steam trade', credit, items.length, rate, code, '', 'skins', 'skin_' + crypto.randomBytes(6).toString('hex'), 'pending', 1, Date.now(), exp);
         db.prepare('UPDATE deposits SET items=?, trade_url=? WHERE id=?').run(JSON.stringify(items), tu, id);
-        db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run('trd_' + crypto.randomBytes(8).toString('hex'), 'trade', au.id, JSON.stringify({ depositId: id, code, tradeUrl: tu, steamid: steamId64(tu), assetids: ids, message: 'CrystalDrop deposit ' + code, ttlMin: Math.max(cfg.skinTtlMin, 15) }), Date.now());
+        db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run('trd_' + crypto.randomBytes(8).toString('hex'), 'trade', au.id, JSON.stringify({ depositId: id, code, tradeUrl: tu, steamid: steamId64(tu), assetids: ids, game, appid: APPS[game], message: 'CrystalDrop deposit ' + code, ttlMin: Math.max(cfg.skinTtlMin, 15) }), Date.now());
         log(id, 'skin offer queued: ' + items.length + ' items, value ' + value + ', credit ' + credit);
         const instantLeft = Math.max(0, cfg.skinInstantMax - db.prepare("SELECT COALESCE(SUM(amount_cr),0) s FROM deposits WHERE user_id=? AND provider='skins' AND status IN ('credited','held') AND (hold_until IS NULL OR status='held') AND created_at > ?").get(au.id, Date.now() - cfg.skinHoldDays * 86400e3).s);
-        return send(res, 200, { id, code, bot: cfg.skinBot, value, credit, rate: cfg.skinRate, count: items.length, expiresAt: new Date(exp).toISOString(), demo: false, held: credit > instantLeft, holdDays: cfg.skinHoldDays });
+        return send(res, 200, { id, code, bot: cfg.skinBot, game, value, credit, rate, count: items.length, expiresAt: new Date(exp).toISOString(), demo: false, held: credit > instantLeft, holdDays: cfg.skinHoldDays });
       }
       const its = Array.isArray(b.items) ? b.items : []; if (!its.length || its.length > cfg.skinMaxItems) return send(res, 400, { error: `choose 1 to ${cfg.skinMaxItems} skins` });
       const items = []; let value = 0;
