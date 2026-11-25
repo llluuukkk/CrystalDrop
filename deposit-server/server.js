@@ -480,7 +480,7 @@ const server = http.createServer(async (req, res) => {
       const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to deposit' });
       if (!pubUser(au).verified) return send(res, 403, { error: 'confirm your email address first (check your inbox)' });
       if (limited(ip)) return send(res, 429, { error: 'too many requests' });
-      if (!botOnline()) return send(res, 503, { error: 'the trade bot is offline right now, try again in a few minutes' });
+      if (!botOnline()) return send(res, 503, { error: 'skin deposits are unavailable right now, try again in a few minutes' });
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       const tu = String(b.tradeUrl || '').trim(); if (!TRADE_URL.test(tu)) return send(res, 400, { error: 'enter your Steam trade URL (https://steamcommunity.com/tradeoffer/new/?partner=...&token=...)' });
       const sid = steamId64(tu), recent = db.prepare("SELECT id FROM bot_jobs WHERE type='inventory' AND user_id=? AND created_at > ? AND status != 'failed' AND payload LIKE ? ORDER BY created_at DESC LIMIT 1").get(au.id, Date.now() - 60000, '%"steamid":"' + sid + '"%');
@@ -544,7 +544,7 @@ const server = http.createServer(async (req, res) => {
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
       const tu = String(b.tradeUrl || '').trim(); if (!TRADE_URL.test(tu)) return send(res, 400, { error: 'enter your Steam trade URL (https://steamcommunity.com/tradeoffer/new/?partner=...&token=...)' });
       if (cfg.skins === 'bot') {                                                                      // real skins: price comes from the inventory the bot read + Skinport, never from the browser
-        if (!botOnline()) return send(res, 503, { error: 'the trade bot is offline right now, try again in a few minutes' });
+        if (!botOnline()) return send(res, 503, { error: 'skin deposits are unavailable right now, try again in a few minutes' });
         const j = db.prepare("SELECT * FROM bot_jobs WHERE id=? AND type='inventory' AND status='done'").get(String(b.invId || '')); if (!j || j.user_id !== au.id || j.created_at < Date.now() - 20 * 60e3) return send(res, 400, { error: 'your inventory list expired, load it again' });
         const ids = [...new Set((Array.isArray(b.assetids) ? b.assetids : []).map(String))]; if (!ids.length || ids.length > cfg.skinMaxItems) return send(res, 400, { error: `choose 1 to ${cfg.skinMaxItems} skins` });
         const P = await skinPrices(); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
