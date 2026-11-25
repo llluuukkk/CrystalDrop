@@ -76,6 +76,23 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
       db.prepare('UPDATE users SET banned=?, ban_reason=? WHERE id=?').run(on, on ? why : null, u.id); if (on) killSessions(u.id);
       audit(req, on ? 'ban' : 'unban', u.id + ' ' + u.name, why); return { ok: true };
     },
+    deleteUser(b, req) {       // permanent: removes the account and its personal data; money records (ledger, deposits, rounds, bets) stay for your books
+      const u = one('SELECT * FROM users WHERE id=?', String(b.id || '')); if (!u) throw Object.assign(new Error('no such user'), { code: 404 });
+      if (String(b.confirm || '') !== u.name) throw new Error('type the exact player name to confirm');
+      const money = u.bal_c + u.pool_c + u.vault_c;
+      if (money > 0 && !b.force) throw new Error('this player still holds ' + cr(money) + ' CR (cash, skins or vault). Take it out first, or tick "delete anyway"');
+      if (one("SELECT COUNT(*) n FROM deposits WHERE user_id=? AND provider='skins' AND (status='held' OR (status='pending' AND expires_at > ?))", u.id, Date.now()).n) throw new Error('this player has a skin trade on hold or open. Reverse it first (Deposits > Reverse) or wait');
+      let bets = 0; try { bets = one("SELECT COUNT(*) n FROM sp_bets WHERE user_id=? AND status='open'", u.id).n; } catch (e) {}
+      if (bets) throw new Error('this player has ' + bets + ' open sports bet(s). Let them settle first');
+      return PLAY.tx(() => {
+        for (const t of ['sessions', 'email_tokens', 'login_codes', 'mutes', 'chat', 'feed', 'fair', 'sess', 'skins', 'bot_jobs']) { try { db.prepare('DELETE FROM ' + t + ' WHERE user_id=?').run(u.id); } catch (e) {} }
+        try { db.prepare('DELETE FROM tips WHERE from_id=? OR to_id=?').run(u.id, u.id); } catch (e) {}
+        try { db.prepare("UPDATE rounds SET name='deleted' WHERE user_id=?").run(u.id); } catch (e) {}
+        try { db.prepare('UPDATE users SET referred_by=NULL WHERE referred_by=?').run(u.id); } catch (e) {}
+        db.prepare('DELETE FROM users WHERE id=?').run(u.id);
+        audit(req, 'delete-user', u.id + ' ' + u.name, (u.email || 'steam ' + u.steam_id) + ', held ' + cr(money) + ' CR' + (b.force ? ' (forced)' : '')); return { ok: true };
+      });
+    },
     mute(b, req) {
       const u = one('SELECT id, name FROM users WHERE id=?', String(b.id || '')); if (!u) throw Object.assign(new Error('no such user'), { code: 404 });
       const m = Math.max(0, Math.min(525600, Math.floor(+b.minutes) || 0));
@@ -138,7 +155,7 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
     backupNow(b, req) { const name = makeBackup(); audit(req, 'backup', name, ''); return { ok: true, name }; },
     log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
   };
-  const ROUTES = { skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
+  const ROUTES = { deleteUser: API.deleteUser, skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
 
   async function route(req, res, url) {
     const P = url.pathname;
@@ -238,11 +255,12 @@ async Backups(){const r=await api('backups');const mb=n=>(n/1048576).toFixed(2)+
  tbl(['File',{t:'Size',n:1},'When',''],r.files.map(x=>({cells:[x.name,mb(x.size),dt(x.ts),E('button',{cls:'b',on:{click:e=>{e.stopPropagation();dl(x.name)}}},'Download')]}))))},
 async Log(){const r=await api('log',{limit:200});show(tbl(['When','Action','Target','Detail','IP'],r.log.map(x=>({cells:[dt(x.ts),x.action,x.target,x.detail,x.ip]}))))},
 };
-async function PLAYER(id){const r=await api('user',{id}),u=r.user,s=r.stats,amt=E('input',{placeholder:'+50 or -20',size:10}),why=E('input',{placeholder:'reason (required)',size:28}),mins=E('input',{placeholder:'minutes',size:7,value:'60'}),bwhy=E('input',{placeholder:'ban reason',size:24});
+async function PLAYER(id){const r=await api('user',{id}),u=r.user,s=r.stats,amt=E('input',{placeholder:'+50 or -20',size:10}),why=E('input',{placeholder:'reason (required)',size:28}),mins=E('input',{placeholder:'minutes',size:7,value:'60'}),bwhy=E('input',{placeholder:'ban reason',size:24}),dname=E('input',{placeholder:'type the player name',size:24}),dforce=E('input',{type:'checkbox'});
  const act=(fn,ok)=>async()=>{try{await fn();toast(ok);PLAYER(id)}catch(e){toast(e.message,1)}};
  show(E('button',{cls:'b',on:{click:()=>start()}},'< Back'),E('div',{cls:'card',style:'margin-top:12px'},E('h3',null,u.name+' ',u.banned?E('span',{cls:'tag r'},'banned'):null,u.muted?E('span',{cls:'tag y'},' muted until '+dt(u.muted)):null),
   E('div',{cls:'m'},'id '+u.id+' · '+(u.email||'steam '+u.steam)+' · '+(u.verified?'email verified':'email NOT verified')+' · joined '+dt(u.created)+(u.banned&&u.banReason?' · ban reason: '+u.banReason:''))),
  E('div',{cls:'grid'},K('Cash',fmt(u.bal)),K('Skins staked',fmt(u.pool)),K('Vault',fmt(u.vault)),K('Locked (unwagered)',fmt(u.lock)),K('Wagered',fmt(s.wagered)),K('Net result for player',fmt(s.net),s.net>=0?'g':'r'),K('Rounds',s.rounds),K('Deposited',fmt(s.deposited)+' CR')),
+ E('div',{cls:'card'},E('h3',null,'Delete account'),E('div',{cls:'row'},dname,E('label',{cls:'m',style:'display:flex;gap:6px;align-items:center'},dforce,'delete even if it still holds CR'),E('button',{cls:'b red',on:{click:async()=>{try{await api('deleteUser',{id,confirm:dname.value,force:dforce.checked});toast('Account deleted');tab='Players';start()}catch(e){toast(e.message,1)}}}},'Delete forever')),E('div',{cls:'m'},'Type the exact player name ('+u.name+') to confirm. This cannot be undone. Chat, sessions, skins and login are removed; deposit, ledger and round records stay for your books.')),
  E('div',{cls:'card'},E('h3',null,'Adjust balance'),E('div',{cls:'row'},amt,why,E('button',{cls:'b pri',on:{click:act(()=>api('adjust',{id,amount:amt.value,reason:why.value}),'Balance updated')}},'Apply')),E('div',{cls:'m'},'Use a plus to credit, a minus to debit. Every change is written to the ledger and the log.')),
  E('div',{cls:'card'},E('h3',null,'Moderation'),E('div',{cls:'row'},mins,E('button',{cls:'b',on:{click:act(()=>api('mute',{id,minutes:mins.value}),'Muted')}},'Mute chat'),E('button',{cls:'b',on:{click:act(()=>api('mute',{id,minutes:0}),'Unmuted')}},'Unmute')),
   E('div',{cls:'row'},u.banned?E('button',{cls:'b pri',on:{click:act(()=>api('ban',{id,banned:false}),'Unbanned')}},'Unban'):[bwhy,E('button',{cls:'b red',on:{click:act(()=>api('ban',{id,banned:true,reason:bwhy.value}),'Banned, sessions ended')}},'Ban player')])),
