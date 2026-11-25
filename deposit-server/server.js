@@ -28,7 +28,7 @@ const cfg = {
   skinInstantMax: E.SKIN_INSTANT_MAX !== undefined && E.SKIN_INSTANT_MAX !== '' ? Math.max(0, +E.SKIN_INSTANT_MAX) : 100,   // CR a player may get instantly from skins (per player, per hold window); anything above is held
   skinHoldDays: E.SKIN_HOLD_DAYS !== undefined && E.SKIN_HOLD_DAYS !== '' ? Math.max(0, +E.SKIN_HOLD_DAYS) : 7,   // Steam can reverse a trade for about this long
   skinRate: Math.min(1, Math.max(0.5, +E.SKIN_RATE || 0.9)),
-  skinRateRust: Math.min(1, Math.max(0.3, +E.SKIN_RATE_RUST || 0.8)),            // Rust skins are thinner on the market: a lower rate by default
+  skinRateRust: Math.min(1, Math.max(0.3, +E.SKIN_RATE_RUST || 0.995)),            // Rust skins are thinner on the market: same 99.5% as CS2 by default
   rust: E.SKIN_RUST !== '0',                                                      // set SKIN_RUST=0 to switch Rust deposits off                    // CR credited per $1 of skin market value
   skinTtlMin: +E.SKIN_TTL_MIN || 15, skinMaxItems: +E.SKIN_MAX_ITEMS || 30, skinBot: E.SKIN_BOT_NAME || 'CrystalDropBot',
   email: { provider: E.EMAIL_PROVIDER || (E.RESEND_API_KEY ? 'resend' : 'console'), resendKey: E.RESEND_API_KEY || '', from: E.EMAIL_FROM || 'CrystalDrop <no-reply@example.com>' },
@@ -150,7 +150,7 @@ const steamId64 = tu => { const m = String(tu).match(/partner=(\d{1,10})/); retu
 function finishSkin(d, got, oid) {
   if (['credited', 'held'].includes(d.status)) return d.status;
   const items = (Array.isArray(got) ? got : []).map(x => ({ assetid: String(x.assetid || ''), name: String(x.name || '').slice(0, 120), price: +x.price || 0 }));
-  const value = +items.reduce((a, x) => a + x.price, 0).toFixed(2), credit = Math.floor(value * rateOf(gameOf(d)) * 100) / 100;
+  const value = +items.reduce((a, x) => a + x.price, 0).toFixed(2), credit = Math.floor(+(value * rateOf(gameOf(d)) * 100).toFixed(6)) / 100;
   if (!items.length || !(credit > 0)) { q.upd.run('expired', d.confirmations, null, 'accepted but nothing creditable', d.id); log(d.id, 'ACCEPTED BUT NOTHING CREDITABLE — check the bot inventory'); return 'expired'; }
   const used = db.prepare("SELECT COALESCE(SUM(amount_cr),0) s FROM deposits WHERE user_id=? AND provider='skins' AND status IN ('credited','held') AND (hold_until IS NULL OR status='held') AND created_at > ?").get(d.user_id, Date.now() - cfg.skinHoldDays * 86400e3).s;
   db.prepare('UPDATE deposits SET amount_cr=?, items=?, crypto_amount=? WHERE id=?').run(credit, JSON.stringify(items), items.length, d.id); d = { ...d, amount_cr: credit };
@@ -498,7 +498,7 @@ const server = http.createServer(async (req, res) => {
       const r = jsonOr(j.result, {}); if (j.status !== 'done') return send(res, 200, { status: 'failed', error: String(r.error || 'could not read the inventory').slice(0, 200) });
       const game = jsonOr(j.payload, {}).game === 'rust' ? 'rust' : 'cs2', rate = rateOf(game), P = await skinPrices(game); if (!P) return send(res, 200, { status: 'failed', error: 'skin prices are unavailable right now, try again shortly' });
       let hidden = 0; const items = [];
-      for (const it of Array.isArray(r.items) ? r.items : []) { const pr = P.get(it.name); if (!(pr >= 0.03) || !it.assetid) { hidden++; continue; } items.push({ assetid: String(it.assetid), name: String(it.name).slice(0, 120), wear: String(it.wear || '').slice(0, 24), icon: /^[\w-]{20,400}$/.test(String(it.icon || '')) ? it.icon : '', price: pr, credit: Math.floor(pr * rate * 100) / 100 }); }
+      for (const it of Array.isArray(r.items) ? r.items : []) { const pr = P.get(it.name); if (!(pr >= 0.03) || !it.assetid) { hidden++; continue; } items.push({ assetid: String(it.assetid), name: String(it.name).slice(0, 120), wear: String(it.wear || '').slice(0, 24), icon: /^[\w-]{20,400}$/.test(String(it.icon || '')) ? it.icon : '', price: pr, credit: Math.floor(+(pr * rate * 100).toFixed(6)) / 100 }); }
       items.sort((a, b2) => b2.price - a.price);
       return send(res, 200, { status: 'ready', items: items.slice(0, 400), hidden, rate, game });
     }
@@ -555,7 +555,7 @@ const server = http.createServer(async (req, res) => {
         const P = await skinPrices(game); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
         const inv = new Map((jsonOr(j.result, {}).items || []).map(i => [String(i.assetid), i])), items = []; let value = 0;
         for (const id of ids) { const it = inv.get(id), pr = it && P.get(it.name); if (!it || !(pr >= 0.03)) return send(res, 400, { error: 'one of those skins can no longer be deposited, reload your inventory' }); items.push({ assetid: id, name: String(it.name).slice(0, 120), wear: String(it.wear || '').slice(0, 24), price: pr }); value += pr; }
-        value = +value.toFixed(2); const credit = Math.floor(value * rate * 100) / 100;
+        value = +value.toFixed(2); const credit = Math.floor(+(value * rate * 100).toFixed(6)) / 100;
         if (!(credit >= cfg.min && credit <= cfg.max)) return send(res, 400, { error: `the offer must be worth between ${cfg.min} and ${cfg.max} CR after the ${Math.round(rate * 100)}% rate` });
         for (const o of db.prepare("SELECT items FROM deposits WHERE provider='skins' AND status='pending' AND expires_at > ?").all(Date.now())) if (jsonOr(o.items, []).some(i => ids.includes(String(i.assetid)))) return send(res, 400, { error: 'one of those skins is already in an open offer' });
         db.prepare("UPDATE deposits SET status='expired', raw_status='replaced' WHERE user_id=? AND provider='skins' AND status='pending'").run(au.id);   // one open offer per player
@@ -570,7 +570,7 @@ const server = http.createServer(async (req, res) => {
       const its = Array.isArray(b.items) ? b.items : []; if (!its.length || its.length > cfg.skinMaxItems) return send(res, 400, { error: `choose 1 to ${cfg.skinMaxItems} skins` });
       const items = []; let value = 0;
       for (const it of its) { const name = String(it && it.name || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 120), price = +(it && it.price); if (name.length < 3 || !(price >= 0.03 && price <= cfg.max)) return send(res, 400, { error: 'invalid skin in the offer' }); items.push({ name, price: +price.toFixed(2), wear: String(it.wear || '').slice(0, 20) }); value += price; }
-      value = +value.toFixed(2); const credit = Math.floor(value * cfg.skinRate * 100) / 100;
+      value = +value.toFixed(2); const credit = Math.floor(+(value * cfg.skinRate * 100).toFixed(6)) / 100;
       if (!(credit >= cfg.min && credit <= cfg.max)) return send(res, 400, { error: `the offer must be worth between ${cfg.min} and ${cfg.max} CR after the ${Math.round(cfg.skinRate * 100)}% rate` });
       const id = 'dep_' + crypto.randomBytes(8).toString('hex'), code = 'CD-' + Array.from(crypto.randomBytes(4), x => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[x % 31]).join(''), exp = Date.now() + cfg.skinTtlMin * 60000;
       q.ins.run(id, au.id, 'CS2', 'Steam trade', credit, items.length, cfg.skinRate, code, '', 'skins', 'skin_' + crypto.randomBytes(6).toString('hex'), 'pending', 1, Date.now(), exp);
