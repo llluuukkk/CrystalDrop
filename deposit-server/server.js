@@ -9,7 +9,9 @@ try { for (const l of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').spli
 const E = process.env;
 const cfg = {
   port: +E.PORT || 8788,
-  provider: E.PROVIDER || (E.NOWPAYMENTS_API_KEY ? 'nowpayments' : 'mock'),     // 'nowpayments' | 'mock'
+  provider: E.PROVIDER || (E.NOWPAYMENTS_API_KEY ? 'nowpayments' : 'mock'),     // 'nowpayments' | 'paygate' | 'mock'
+  pgSecret: E.PAYGATE_SECRET || E.ADMIN_TOKEN || '',                             // signs the callback URL we give PayGate.to (their crypto callbacks carry no signature)
+  pgAddr: { btc: E.PAYGATE_ADDR_BTC || '', sol: E.PAYGATE_ADDR_SOL || '', evm: E.PAYGATE_ADDR_EVM || '' },   // YOUR wallets: PayGate forwards every payment straight to them
   apiKey: E.NOWPAYMENTS_API_KEY || '', ipnSecret: E.NOWPAYMENTS_IPN_SECRET || '',
   publicUrl: (E.PUBLIC_URL || '').replace(/\/$/, ''),                            // https://api.yoursite.com  (where NOWPayments can reach /webhook)
   allowOrigin: E.ALLOWED_ORIGIN || '*',                                          // set to your site, e.g. https://crystaldrop.gg
@@ -27,14 +29,15 @@ const cfg = {
   email: { provider: E.EMAIL_PROVIDER || (E.RESEND_API_KEY ? 'resend' : 'console'), resendKey: E.RESEND_API_KEY || '', from: E.EMAIL_FROM || 'CrystalDrop <no-reply@example.com>' },
 };
 // coin + network (as the page sends them) -> NOWPayments pay_currency code. Verify against GET /v1/currencies for your account.
-const COINS = {   // deposits: the coins enabled in the NOWPayments dashboard (Settings > Coins)
-  'SOL|Solana': { code: 'sol', conf: 32 },
-  'BTC|Bitcoin': { code: 'btc', conf: 2 },
-  'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12 },
-  'USDT|Ethereum (ERC-20)': { code: 'usdterc20', conf: 12 },
-  'USDC|Ethereum (ERC-20)': { code: 'usdc', conf: 12 },
+const COINS = {   // deposits. code = NOWPayments pay_currency; pg = PayGate.to ticker, a = which of YOUR wallets it pays into, cg/bn = price sources, pc = confirmations PayGate waits for
+  'SOL|Solana': { code: 'sol', conf: 32, pg: 'sol', a: 'sol', cg: 'solana', bn: 'SOLUSDT', pc: 1, dec: 6 },
+  'BTC|Bitcoin': { code: 'btc', conf: 2, pg: 'btc', a: 'btc', cg: 'bitcoin', bn: 'BTCUSDT', pc: 2, dec: 8 },
+  'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12, pg: 'eth', a: 'evm', cg: 'ethereum', bn: 'ETHUSDT', pc: 12, dec: 8 },
+  'USDT|Ethereum (ERC-20)': { code: 'usdterc20', conf: 12, pg: 'erc20/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDC|Ethereum (ERC-20)': { code: 'usdc', conf: 12, pg: 'erc20/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
 };
 if (cfg.provider === 'nowpayments' && (!cfg.apiKey || !cfg.ipnSecret || !cfg.publicUrl)) { console.error('NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET and PUBLIC_URL are required for the nowpayments provider.'); process.exit(1); }
+if (cfg.provider === 'paygate' && (!cfg.publicUrl || !cfg.pgSecret || !Object.values(cfg.pgAddr).some(Boolean))) { console.error('PROVIDER=paygate needs PUBLIC_URL, PAYGATE_SECRET (or ADMIN_TOKEN) and at least one of PAYGATE_ADDR_BTC / PAYGATE_ADDR_SOL / PAYGATE_ADDR_EVM'); process.exit(1); }
 
 // ---- database ----
 const db = new DatabaseSync(cfg.db);
@@ -153,6 +156,11 @@ async function steamVerify(params) {                                            
 // ---- providers ----
 const MINC = {};
 async function minCR(coin) {   // provider minimum in CR (1 CR = $1), exactly as NOWPayments reports it, cached 10 min
+  if (cfg.provider === 'paygate') {                                          // PayGate: anything below the coin's forwarding fee is stuck, so ask for their minimum (USD)
+    const c = MINC[coin.code]; if (c && Date.now() - c.at < 600000) return c.v; let v = cfg.min;
+    try { const r = await fetch('https://api.paygate.to/crypto/' + coin.pg + '/info.php', { signal: AbortSignal.timeout(10000) }); const j = await r.json().catch(() => ({})); const m = +j.minimum; if (r.ok && m > 0) v = Math.max(cfg.min, Math.ceil(m * 1.15 * 100) / 100); } catch (e) { if (c) return c.v; }
+    MINC[coin.code] = { v, at: Date.now() }; return v;
+  }
   if (cfg.provider !== 'nowpayments') return cfg.min;
   const c = MINC[coin.code]; if (c && Date.now() - c.at < 600000) return c.v;
   let v = cfg.min;
@@ -162,7 +170,27 @@ async function minCR(coin) {   // provider minimum in CR (1 CR = $1), exactly as
   } catch (e) { if (c) return c.v; }
   MINC[coin.code] = { v, at: Date.now() }; return v;
 }
+const PRICES = {};
+async function usdPrice(coin) {                                                // USD price of one coin: CoinGecko, then Binance; cached 60 s, stale prices are used for up to 30 min if both are down
+  if (coin.stable) return 1;
+  const c = PRICES[coin.cg]; if (c && Date.now() - c.at < 60000) return c.v;
+  let v = 0;
+  try { const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=' + coin.cg + '&vs_currencies=usd', { signal: AbortSignal.timeout(8000) }); const j = await r.json().catch(() => ({})); v = +(j[coin.cg] && j[coin.cg].usd); } catch (e) {}
+  if (!(v > 0)) { try { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=' + coin.bn, { signal: AbortSignal.timeout(8000) }); const j = await r.json().catch(() => ({})); v = +j.price; } catch (e) {} }
+  if (v > 0) { PRICES[coin.cg] = { v, at: Date.now() }; return v; }
+  if (c && Date.now() - c.at < 1800e3) return c.v;
+  throw new Error('price unavailable, try again in a minute');
+}
+const pgKey = id => crypto.createHmac('sha256', cfg.pgSecret).update('paygate:' + id).digest('hex').slice(0, 32);
 const providers = {
+  async paygate(d, coin) {
+    const addr = cfg.pgAddr[coin.a]; if (!addr) throw new Error('this coin is not enabled yet');
+    const price = await usdPrice(coin), f = Math.pow(10, coin.dec), cryptoAmount = Math.ceil(d.amount_cr / price * f) / f;
+    const cb = cfg.publicUrl + '/webhook/paygate?d=' + d.id + '&k=' + pgKey(d.id);
+    const r = await fetch('https://api.paygate.to/crypto/' + coin.pg + '/wallet.php?' + new URLSearchParams({ address: addr, callback: cb, pending: '0', confirmations: String(coin.pc) }), { signal: AbortSignal.timeout(20000) });
+    const j = await r.json().catch(() => ({})); if (!r.ok || !j.address_in) throw new Error('provider: ' + (j.error || j.message || r.status));
+    return { providerId: 'pg_' + d.id, address: j.address_in, memo: '', cryptoAmount, rate: price };
+  },
   async nowpayments(d, coin) {
     const r = await fetch((cfg.sandbox ? 'https://api-sandbox.nowpayments.io' : 'https://api.nowpayments.io') + '/v1/payment', { method: 'POST', signal: AbortSignal.timeout(35000), headers: { 'x-api-key': cfg.apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ price_amount: d.amount_cr, price_currency: 'usd', pay_currency: coin.code, order_id: d.id, order_description: 'CrystalDrop deposit', ipn_callback_url: cfg.publicUrl + '/webhook/nowpayments', is_fixed_rate: true }) });
@@ -433,6 +461,21 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { /* provider unreachable: the webhook may still arrive */ }
       }
       return send(res, 200, pub(d));
+    }
+    if (cfg.provider === 'paygate' && req.method === 'GET' && url.pathname === '/webhook/paygate') {          // PayGate.to calls this (GET) once the payment is confirmed and forwarded to your wallet
+      const id = String(url.searchParams.get('d') || ''), k = String(url.searchParams.get('k') || ''), want = pgKey(id);
+      if (!(k.length === want.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(want)))) { log(null, 'paygate callback with a bad key from ' + ip); res.writeHead(401, { 'Content-Type': 'text/plain' }); return res.end('bad key'); }
+      const d = q.get.get(id), txid = String(url.searchParams.get('txid_in') || '').slice(0, 200), got = +url.searchParams.get('value_coin'), cn = String(url.searchParams.get('coin') || '').toLowerCase();
+      const okText = t => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(t || 'ok'); };
+      if (!d || d.provider !== 'paygate') return okText();
+      const coin = COINS[d.coin + '|' + d.network];
+      if (!coin || cn !== coin.pg.replace('/', '_') || !(got > 0)) { log(d.id, 'paygate callback does not match this deposit: coin=' + cn + ' value=' + got); return okText(); }
+      if (d.status === 'credited') { log(d.id, 'EXTRA PAYMENT after the deposit was credited: ' + got + ' ' + cn + ' tx ' + txid + ' — needs manual review'); return okText(); }
+      let price; try { price = await usdPrice(coin); } catch (e) { res.writeHead(503, { 'Content-Type': 'text/plain' }); return res.end('price unavailable'); }     // non-200: PayGate retries later
+      const paid = got * price;
+      let raw = 'finished'; if (!d.open && paid < d.amount_cr * 0.98) raw = 'partially_paid';       // fixed amount: sent noticeably less than asked -> manual review, nothing credited
+      log(d.id, 'paygate callback ' + got + ' ' + cn + ' ≈ ' + paid.toFixed(2) + ' CR, tx ' + txid);
+      applyStatus(d, raw, txid, paid); return okText();
     }
     if (req.method === 'POST' && url.pathname === '/webhook/nowpayments') {
       const raw = await readBody(req), sig = String(req.headers['x-nowpayments-sig'] || '');
