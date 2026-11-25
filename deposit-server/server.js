@@ -30,9 +30,9 @@ const cfg = {
 };
 // coin + network (as the page sends them) -> NOWPayments pay_currency code. Verify against GET /v1/currencies for your account.
 const COINS = {   // deposits. code = NOWPayments pay_currency; pg = PayGate.to ticker, a = which of YOUR wallets it pays into, cg/bn = price sources, pc = confirmations PayGate waits for
-  'SOL|Solana': { code: 'sol', conf: 32, pg: 'sol', a: 'sol', cg: 'solana', bn: 'SOLUSDT', pc: 1, dec: 6 },
-  'BTC|Bitcoin': { code: 'btc', conf: 2, pg: 'btc', a: 'btc', cg: 'bitcoin', bn: 'BTCUSDT', pc: 2, dec: 8 },
-  'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12, pg: 'eth', a: 'evm', cg: 'ethereum', bn: 'ETHUSDT', pc: 12, dec: 8 },
+  'SOL|Solana': { code: 'sol', conf: 32, pg: 'sol', a: 'sol', cg: 'solana', bn: 'SOLUSDT', sym: 'SOL', kr: 'SOLUSD', pc: 1, dec: 6 },
+  'BTC|Bitcoin': { code: 'btc', conf: 2, pg: 'btc', a: 'btc', cg: 'bitcoin', bn: 'BTCUSDT', sym: 'BTC', kr: 'XBTUSD', pc: 2, dec: 8 },
+  'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12, pg: 'eth', a: 'evm', cg: 'ethereum', bn: 'ETHUSDT', sym: 'ETH', kr: 'ETHUSD', pc: 12, dec: 8 },
   'USDT|Ethereum (ERC-20)': { code: 'usdterc20', conf: 12, pg: 'erc20/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
   'USDC|Ethereum (ERC-20)': { code: 'usdc', conf: 12, pg: 'erc20/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
 };
@@ -174,9 +174,11 @@ const PRICES = {};
 async function usdPrice(coin) {                                                // USD price of one coin: CoinGecko, then Binance; cached 60 s, stale prices are used for up to 30 min if both are down
   if (coin.stable) return 1;
   const c = PRICES[coin.cg]; if (c && Date.now() - c.at < 60000) return c.v;
-  let v = 0;
-  try { const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=' + coin.cg + '&vs_currencies=usd', { signal: AbortSignal.timeout(8000) }); const j = await r.json().catch(() => ({})); v = +(j[coin.cg] && j[coin.cg].usd); } catch (e) {}
-  if (!(v > 0)) { try { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=' + coin.bn, { signal: AbortSignal.timeout(8000) }); const j = await r.json().catch(() => ({})); v = +j.price; } catch (e) {} }
+  let v = 0; const H = { 'User-Agent': 'CrystalDrop/1.0', Accept: 'application/json' }, tryGet = async (url, pick) => { if (v > 0) return; try { const r = await fetch(url, { headers: H, signal: AbortSignal.timeout(8000) }); const j = await r.json().catch(() => ({})); v = +pick(j) || 0; if (!(v > 0)) console.error('price source', url.split('/')[2], 'gave nothing, HTTP', r.status); } catch (e) { console.error('price source', url.split('/')[2], 'failed:', e.message); } };
+  await tryGet('https://api.coinbase.com/v2/prices/' + coin.sym + '-USD/spot', j => j.data && j.data.amount);                                   // works from US data centres (Binance does not)
+  await tryGet('https://api.kraken.com/0/public/Ticker?pair=' + coin.kr, j => { const k = j.result && Object.keys(j.result)[0]; return k && j.result[k].c[0]; });
+  await tryGet('https://api.coingecko.com/api/v3/simple/price?ids=' + coin.cg + '&vs_currencies=usd', j => j[coin.cg] && j[coin.cg].usd);
+  await tryGet('https://api.binance.com/api/v3/ticker/price?symbol=' + coin.bn, j => j.price);
   if (v > 0) { PRICES[coin.cg] = { v, at: Date.now() }; return v; }
   if (c && Date.now() - c.at < 1800e3) return c.v;
   throw new Error('price unavailable, try again in a minute');
