@@ -50,6 +50,14 @@ const COINS = {   // deposits. code = NOWPayments pay_currency; pg = PayGate.to 
   'USDC|Polygon': { code: 'usdcmatic', conf: 30, pg: 'polygon/usdc', a: 'evm', stable: 1, pc: 30, dec: 6 },
   'USDT|Base': { code: 'usdtbase', conf: 12, pg: 'base/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
   'USDC|Base': { code: 'usdcbase', conf: 12, pg: 'base/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDT|Arbitrum': { code: 'usdtarb', conf: 12, pg: 'arbitrum/usdt0', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDC|Arbitrum': { code: 'usdcarb', conf: 12, pg: 'arbitrum/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDT|Optimism': { code: 'usdtop', conf: 12, pg: 'optimism/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDC|Optimism': { code: 'usdcop', conf: 12, pg: 'optimism/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDT|Avalanche': { code: 'usdtavax', conf: 12, pg: 'avax-c/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDC|Avalanche': { code: 'usdcavax', conf: 12, pg: 'avax-c/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDT|Solana': { code: 'usdtsol', conf: 32, pg: 'sol/usdt', a: 'sol', stable: 1, pc: 32, dec: 6 },
+  'USDC|Solana': { code: 'usdcsol', conf: 32, pg: 'sol/usdc', a: 'sol', stable: 1, pc: 32, dec: 6 },
 };
 if (cfg.provider === 'nowpayments' && (!cfg.apiKey || !cfg.ipnSecret || !cfg.publicUrl)) { console.error('NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET and PUBLIC_URL are required for the nowpayments provider.'); process.exit(1); }
 if (cfg.provider === 'paygate' && (!cfg.publicUrl || !cfg.pgSecret || !Object.values(cfg.pgAddr).some(Boolean))) { console.error('PROVIDER=paygate needs PUBLIC_URL, PAYGATE_SECRET (or ADMIN_TOKEN) and at least one of PAYGATE_ADDR_BTC / PAYGATE_ADDR_SOL / PAYGATE_ADDR_EVM'); process.exit(1); }
@@ -253,6 +261,8 @@ async function usdPrice(coin) {                                                /
   if (c && Date.now() - c.at < 1800e3) return c.v;
   throw new Error('price unavailable, try again in a minute');
 }
+// PayGate names the paid coin like erc20_usdt; for other chains the exact spelling isn't documented, so also accept the same token ticker (usdt0 counts as usdt)
+const pgCoinOk = (cn, pg) => { const w = pg.replace('/', '_'); if (cn === w) return true; const t = s => String(s).split(/[_\/.\-]/).filter(Boolean).pop().replace(/0$/, ''); return t(cn) === t(pg) && /^(usdt|usdc)$/.test(t(pg)); };
 const pgKey = id => crypto.createHmac('sha256', cfg.pgSecret).update('paygate:' + id).digest('hex').slice(0, 32);
 const providers = {
   async paygate(d, coin) {
@@ -621,7 +631,7 @@ const server = http.createServer(async (req, res) => {
       const okText = t => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(t || 'ok'); };
       if (!d || d.provider !== 'paygate') return okText();
       const coin = COINS[d.coin + '|' + d.network];
-      if (!coin || cn !== coin.pg.replace('/', '_') || !(got > 0)) { log(d.id, 'paygate callback does not match this deposit: coin=' + cn + ' value=' + got); return okText(); }
+      if (!coin || !pgCoinOk(cn, coin.pg) || !(got > 0)) { log(d.id, 'paygate callback does not match this deposit: coin=' + cn + ' value=' + got); return okText(); }
       if (d.status === 'credited') { log(d.id, 'EXTRA PAYMENT after the deposit was credited: ' + got + ' ' + cn + ' tx ' + txid + ' — needs manual review'); return okText(); }
       let price; try { price = await usdPrice(coin); } catch (e) { res.writeHead(503, { 'Content-Type': 'text/plain' }); return res.end('price unavailable'); }     // non-200: PayGate retries later
       const paid = got * price;
