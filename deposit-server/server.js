@@ -40,6 +40,16 @@ const COINS = {   // deposits. code = NOWPayments pay_currency; pg = PayGate.to 
   'ETH|Ethereum (ERC-20)': { code: 'eth', conf: 12, pg: 'eth', a: 'evm', cg: 'ethereum', bn: 'ETHUSDT', sym: 'ETH', kr: 'ETHUSD', pc: 12, dec: 8 },
   'USDT|Ethereum (ERC-20)': { code: 'usdterc20', conf: 12, pg: 'erc20/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
   'USDC|Ethereum (ERC-20)': { code: 'usdc', conf: 12, pg: 'erc20/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  // more EVM chains: PayGate pays them all into the same PAYGATE_ADDR_EVM address (same 0x... address on every chain)
+  'ETH|Base': { code: 'ethbase', conf: 12, pg: 'base/eth', a: 'evm', cg: 'ethereum', bn: 'ETHUSDT', sym: 'ETH', kr: 'ETHUSD', pc: 12, dec: 8 },
+  'BNB|BNB Chain': { code: 'bnbbsc', conf: 15, pg: 'bep20/bnb', a: 'evm', cg: 'binancecoin', bn: 'BNBUSDT', sym: 'BNB', kr: 'BNBUSD', pc: 15, dec: 6 },
+  'POL|Polygon': { code: 'pol', conf: 30, pg: 'polygon/pol', a: 'evm', cg: 'polygon-ecosystem-token', bn: 'POLUSDT', sym: 'POL', kr: 'POLUSD', pc: 30, dec: 4 },
+  'USDT|BNB Chain': { code: 'usdtbsc', conf: 15, pg: 'bep20/usdt', a: 'evm', stable: 1, pc: 15, dec: 6 },
+  'USDC|BNB Chain': { code: 'usdcbsc', conf: 15, pg: 'bep20/usdc', a: 'evm', stable: 1, pc: 15, dec: 6 },
+  'USDT|Polygon': { code: 'usdtmatic', conf: 30, pg: 'polygon/usdt', a: 'evm', stable: 1, pc: 30, dec: 6 },
+  'USDC|Polygon': { code: 'usdcmatic', conf: 30, pg: 'polygon/usdc', a: 'evm', stable: 1, pc: 30, dec: 6 },
+  'USDT|Base': { code: 'usdtbase', conf: 12, pg: 'base/usdt', a: 'evm', stable: 1, pc: 12, dec: 6 },
+  'USDC|Base': { code: 'usdcbase', conf: 12, pg: 'base/usdc', a: 'evm', stable: 1, pc: 12, dec: 6 },
 };
 if (cfg.provider === 'nowpayments' && (!cfg.apiKey || !cfg.ipnSecret || !cfg.publicUrl)) { console.error('NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET and PUBLIC_URL are required for the nowpayments provider.'); process.exit(1); }
 if (cfg.provider === 'paygate' && (!cfg.publicUrl || !cfg.pgSecret || !Object.values(cfg.pgAddr).some(Boolean))) { console.error('PROVIDER=paygate needs PUBLIC_URL, PAYGATE_SECRET (or ADMIN_TOKEN) and at least one of PAYGATE_ADDR_BTC / PAYGATE_ADDR_SOL / PAYGATE_ADDR_EVM'); process.exit(1); }
