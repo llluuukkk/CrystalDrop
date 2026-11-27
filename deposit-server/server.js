@@ -193,6 +193,86 @@ function reverseSkin(d, why) {
 }
 
 
+// ---------- skin withdrawals: CR -> skins from our own Steam inventory (skins only, nothing else can be withdrawn) ----------
+Object.assign(cfg, {
+  skinWd: E.SKIN_WD !== '0',                                                                       // SKIN_WD=0 switches skin withdrawals off
+  skinWdMarkup: Math.min(1.5, Math.max(1, +E.SKIN_WD_MARKUP || 1.02)),                             // a skin costs its market price x this
+  skinWdAuto: E.SKIN_WD_AUTO !== undefined && E.SKIN_WD_AUTO !== '' ? Math.max(0, +E.SKIN_WD_AUTO) : 300,   // withdrawals above this many CR wait for your approval in the admin panel
+  skinWdDay: E.SKIN_WD_DAY !== undefined && E.SKIN_WD_DAY !== '' ? Math.max(0, +E.SKIN_WD_DAY) : 1000,      // CR a player may withdraw per 24 h
+  skinWdMaxPrice: E.SKIN_WD_MAX_PRICE !== undefined && E.SKIN_WD_MAX_PRICE !== '' ? Math.max(1, +E.SKIN_WD_MAX_PRICE) : 5000,   // skins worth more than this (USD) are never offered for withdrawal
+  skinWdMaxItems: Math.min(30, Math.max(1, +E.SKIN_WD_MAX_ITEMS || 10)),
+  skinWdBuyDays: Math.max(1, +E.SKIN_WD_BUY_DAYS || 10),                                           // a skin we have to buy first: refunded if it is not in stock after this many days
+});
+db.exec(`CREATE TABLE IF NOT EXISTS skin_wd (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, game TEXT, trade_url TEXT, items TEXT, cost_c INTEGER NOT NULL, status TEXT NOT NULL, code TEXT, offer_id TEXT, note TEXT, created_at INTEGER, done_at INTEGER);
+CREATE INDEX IF NOT EXISTS swd_u ON skin_wd(user_id, created_at); CREATE INDEX IF NOT EXISTS swd_s ON skin_wd(status, created_at);`);
+const STOCK = {};                                                                                   // what the bot's inventory holds right now, per game (refreshed by a 'stock' job)
+const wdCostC = price => Math.ceil(+(price * cfg.skinWdMarkup * 100).toFixed(6));
+const wdReserved = game => { const r = new Set(), S = STOCK[game];                               // skins in open withdrawals, and ones handed over since the last inventory scan (they may still show in it)
+  for (const w of db.prepare("SELECT items FROM skin_wd WHERE game=? AND (status IN ('review','checking','buying','queued','sent','stuck') OR (status='completed' AND done_at > ?))").all(game, S ? S.at : 0)) for (const i of jsonOr(w.items, [])) if (i.assetid) r.add(String(i.assetid)); return r; };
+const wdOn = () => cfg.skinWd && cfg.skins === 'bot';
+const wdWithdrawable = uid => { const u = db.prepare('SELECT bal_c, lock_c FROM users WHERE id=?').get(uid) || { bal_c: 0, lock_c: 0 }; return Math.max(0, u.bal_c - u.lock_c); };   // CR you bought must be played through once first
+function wdEnsureStock(game) {
+  const S = STOCK[game]; if (S && Date.now() - S.at < 120e3) return; if (!botOnline()) return;
+  if (db.prepare("SELECT 1 FROM bot_jobs WHERE type='stock' AND status IN ('queued','taken') AND created_at > ? AND payload LIKE ?").get(Date.now() - 90e3, '%"game":"' + game + '"%')) return;
+  db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run('stk_' + crypto.randomBytes(6).toString('hex'), 'stock', null, JSON.stringify({ game, appid: APPS[game] }), Date.now());
+}
+function wdQueueJob(w) {
+  const it = jsonOr(w.items, []);
+  db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run('give_' + crypto.randomBytes(6).toString('hex'), 'give', w.user_id, JSON.stringify({ wd: w.id, code: w.code, game: w.game, appid: APPS[w.game], steamid: steamId64(w.trade_url), tradeUrl: w.trade_url, assetids: it.map(i => String(i.assetid)), message: 'CrystalDrop withdrawal ' + w.code }), Date.now());
+}
+function wdRefund(id, note) {                                                                      // gives the CR back, exactly once (ledger ref is unique)
+  db.exec('BEGIN IMMEDIATE');
+  try { const w = db.prepare('SELECT * FROM skin_wd WHERE id=?').get(id); let done = false;
+    if (w && ['review', 'checking', 'buying', 'queued', 'sent', 'stuck'].includes(w.status)) {
+      db.prepare("UPDATE skin_wd SET status='failed', note=?, done_at=? WHERE id=?").run(String(note).slice(0, 200), Date.now(), id);
+      if (q.credit.run(w.user_id, w.cost_c / 100, 'skin withdrawal refunded', 'wdrf:' + id, Date.now()).changes) db.prepare('UPDATE users SET bal_c = bal_c + ? WHERE id=?').run(w.cost_c, w.user_id);
+      db.prepare("UPDATE bot_jobs SET status='failed', done_at=? WHERE type='give' AND status='queued' AND payload LIKE ?").run(Date.now(), '%"wd":"' + id + '"%');
+      done = true; }
+    db.exec('COMMIT'); if (done) log(null, 'skin withdrawal ' + id + ' refunded: ' + note); return done; }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+const wdMarketJob = w => { const names = [...new Set(jsonOr(w.items, []).filter(i => !i.assetid).map(i => i.name))].slice(0, 8);
+  db.prepare("INSERT INTO bot_jobs (id,type,user_id,payload,status,created_at) VALUES (?,?,?,?,'queued',?)").run('mkt_' + crypto.randomBytes(6).toString('hex'), 'market', w.user_id, JSON.stringify({ wd: w.id, game: w.game, appid: APPS[w.game], names }), Date.now()); };
+function wdAdvance(w, from) {                                                                      // next step for a withdrawal: send it if every skin is in stock, otherwise check the Steam Market first
+  const need = jsonOr(w.items, []).some(i => !i.assetid), to = need ? 'checking' : 'queued';
+  const r = db.prepare('UPDATE skin_wd SET status=? WHERE id=? AND status=?').run(to, w.id, from); if (!r.changes) return;
+  if (need) wdMarketJob(w); else wdQueueJob({ ...w, status: 'queued' });
+}
+function wdFulfil() { try {                                                                         // the bot inventory changed: give waiting withdrawals the skins that have arrived
+  for (const w of db.prepare("SELECT * FROM skin_wd WHERE status='buying' ORDER BY created_at").all()) {
+    const S = STOCK[w.game]; if (!S || Date.now() - S.at > 10 * 60e3) continue;
+    const held = wdReserved(w.game), items = jsonOr(w.items, []); let ch = false;
+    for (const it of items) { if (it.assetid) continue; const hit = S.items.find(x => x.name === it.name && !held.has(x.assetid)); if (hit) { it.assetid = hit.assetid; held.add(hit.assetid); ch = true; } }
+    if (ch) db.prepare("UPDATE skin_wd SET items=? WHERE id=? AND status='buying'").run(JSON.stringify(items), w.id);
+    if (items.every(i => i.assetid) && db.prepare("UPDATE skin_wd SET status='queued' WHERE id=? AND status='buying'").run(w.id).changes) { wdQueueJob({ ...w, items: JSON.stringify(items), status: 'queued' }); log(null, 'withdrawal ' + w.code + ': all skins are in stock now, offer queued'); }
+  } } catch (e) { console.error('wdFulfil', e.message); } }
+const WD = {
+  approve(id) { const w = db.prepare('SELECT * FROM skin_wd WHERE id=?').get(id); if (!w) throw Object.assign(new Error('no such withdrawal'), { code: 404 }); if (w.status !== 'review') throw new Error('not waiting for approval (it is ' + w.status + ')');
+    wdAdvance(w, 'review'); return w; },
+  reject(id, why) { const w = db.prepare('SELECT * FROM skin_wd WHERE id=?').get(id); if (!w) throw Object.assign(new Error('no such withdrawal'), { code: 404 }); if (!['review', 'checking', 'buying', 'stuck'].includes(w.status)) throw new Error('only withdrawals that have not been sent yet can be refunded (this one is ' + w.status + ')'); wdRefund(id, 'refused: ' + why); return w; },
+  complete(id) { const w = db.prepare('SELECT * FROM skin_wd WHERE id=?').get(id); if (!w) throw Object.assign(new Error('no such withdrawal'), { code: 404 }); if (w.status !== 'stuck') throw new Error('only stuck withdrawals can be marked sent (this one is ' + w.status + ')'); db.prepare("UPDATE skin_wd SET status='completed', done_at=?, note='marked sent by admin' WHERE id=?").run(Date.now(), id); return w; },
+};
+function wdSweep() { try {
+  for (const w of db.prepare("SELECT w.id FROM skin_wd w WHERE w.status='queued' AND w.created_at < ? AND NOT EXISTS (SELECT 1 FROM bot_jobs j WHERE j.type='give' AND j.payload LIKE '%\"wd\":\"' || w.id || '\"%' AND j.status != 'queued')").all(Date.now() - 15 * 60e3)) wdRefund(w.id, 'the trade service was offline');   // never picked up: safe to refund
+  db.prepare("UPDATE bot_jobs SET status='failed', done_at=? WHERE type='market' AND status IN ('queued','taken') AND created_at < ?").run(Date.now(), Date.now() - 15 * 60e3);
+  for (const w of db.prepare("SELECT * FROM skin_wd WHERE status='checking'").all()) {                // the Steam Market check is retried until the bot answers
+    const js = db.prepare("SELECT COUNT(*) n, MAX(created_at) last, SUM(status IN ('queued','taken')) act FROM bot_jobs WHERE type='market' AND payload LIKE ?").get('%"wd":"' + w.id + '"%');
+    if (js.act) continue; if (js.n >= 6) wdRefund(w.id, 'could not check the Steam Market'); else if (!js.last || js.last < Date.now() - 60e3) wdMarketJob(w); }
+  for (const w of db.prepare("SELECT id FROM skin_wd WHERE status='buying' AND created_at < ?").all(Date.now() - cfg.skinWdBuyDays * 864e5)) wdRefund(w.id, 'we could not get that skin in stock in time');
+  for (const g of db.prepare("SELECT DISTINCT game FROM skin_wd WHERE status='buying'").all()) wdEnsureStock(g.game);
+  wdFulfil();
+  db.prepare("UPDATE skin_wd SET status='stuck', note='no answer from Steam, check the trade by hand' WHERE status IN ('queued','sent') AND created_at < ?").run(Date.now() - 3 * 3600e3);
+} catch (e) { console.error('wdSweep', e.message); } }
+setInterval(wdSweep, 60e3).unref();
+function wdEvent(code, st, oid) {                                                                  // the bot reports what happened to a withdrawal offer
+  const w = db.prepare('SELECT * FROM skin_wd WHERE code=?').get(code); if (!w) return null;
+  if (st === 'accepted') { const r = db.prepare("UPDATE skin_wd SET status='completed', offer_id=COALESCE(?,offer_id), done_at=? WHERE id=? AND status IN ('queued','sent','stuck')").run(oid || null, Date.now(), w.id);
+    if (!r.changes && w.status === 'failed') log(null, 'WITHDRAWAL ' + w.id + ' WAS ACCEPTED AFTER IT WAS REFUNDED — needs manual review'); return 'completed'; }
+  if (['declined', 'canceled', 'expired', 'invalid'].includes(st)) { wdRefund(w.id, 'offer ' + st); return 'failed'; }
+  return w.status;
+}
+const wdPub = w => { const it = jsonOr(w.items, []); return { id: w.id, code: w.code, game: w.game, cost: w.cost_c / 100, count: it.length, items: it.map(i => i.name), waiting: it.filter(i => !i.assetid).length, status: w.status, note: w.note || '', createdAt: w.created_at }; };
+
 // ---- accounts: email + password (scrypt), Steam OpenID, bearer sessions ----
 const sha = x => crypto.createHash('sha256').update(x).digest('hex');
 const scrypt = (pw, salt) => new Promise((ok, no) => crypto.scrypt(pw, salt, 64, { N: 16384, r: 8, p: 1 }, (e, k) => e ? no(e) : ok(k.toString('hex'))));
@@ -284,20 +364,20 @@ const providers = {
 
 // ---- http ----
 const hits = new Map();                                                         // tiny per-IP rate limit for payment creation
-const limited = ip => { const now = Date.now(), a = (hits.get(ip) || []).filter(t => now - t < 3600e3); a.push(now); hits.set(ip, a); return a.length > 20; };
+const limited = ip => { const now = Date.now(), a = (hits.get(ip) || []).filter(t => now - t < 3600e3); a.push(now); hits.set(ip, a); return a.length > (+E.PAY_RATE || 20); };
 // Anti-bot: after a Turnstile check the page gets a 24 h signed pass; sign up, log in and deposits then require it (only when TURNSTILE_SECRET is set).
 const humanKey = () => 'human:' + (E.TURNSTILE_SECRET || '');
 const humanPass = () => { const t = String(Date.now()); return t + '.' + crypto.createHmac('sha256', humanKey()).update(t).digest('hex'); };
 const humanOk = req => { if (!E.TURNSTILE_SECRET) return true; const m = /^(\d{10,15})\.([0-9a-f]{64})$/.exec(req.headers['x-human'] || ''); if (!m || Date.now() - +m[1] > 864e5 || +m[1] > Date.now() + 6e4) return false;
   const want = crypto.createHmac('sha256', humanKey()).update(m[1]).digest(); return crypto.timingSafeEqual(want, Buffer.from(m[2], 'hex')); };
 const send = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': cfg.allowOrigin, 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Human', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS' }); res.end(b); };
-const readBody = req => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) { no(new Error('too large')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); });
+const readBody = (req, max = 1e5) => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > max) { no(new Error('too large')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); });
 const sortKeys = o => Array.isArray(o) ? o.map(sortKeys) : o && typeof o === 'object' ? Object.fromEntries(Object.keys(o).sort().map(k => [k, sortKeys(o[k])])) : o;
 const pub = d => ({ open: !!d.open, id: d.id, status: d.status, confirmations: d.confirmations, required: d.required, txid: d.txid || undefined, address: d.address, amountCR: d.amount_cr, holdUntil: d.hold_until ? new Date(d.hold_until).toISOString() : undefined, game: d.provider === 'skins' ? gameOf(d) : undefined, trade: d.provider === 'skins' ? (String(d.raw_status || '').startsWith('sent') ? 'sent' : (d.raw_status || '')) : undefined });
 
 const PLAY = require('./play.js')({ db, send, readBody, authUser, cfg });
 const SPORTS = require('./sports.js')({ db, send, readBody, authUser, cfg, PLAY });
-const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, SPORTS, killSessions: uid => ET.killSess.run(uid), reverseSkin });
+const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, SPORTS, killSessions: uid => ET.killSess.run(uid), reverseSkin, WD, wdQueueJob, wdPub, APPS });
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), ip = req.socket.remoteAddress;
   try {
@@ -498,6 +578,67 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { id: d.id, address: p.address, memo: p.memo, cryptoAmount: p.cryptoAmount, cryptoAmt: p.cryptoAmount, rate: p.rate, expiresAt: new Date(exp).toISOString(), confirmationsRequired: coin.conf, open, minCR: open ? d.amount_cr : undefined });
     }
     let m;
+    // ---- skin withdrawals (players): choose skins from our inventory, pay for them in CR ----
+    if (url.pathname === '/skin-withdraw/config' && req.method === 'GET') { const au = authUser(req); return send(res, 200, { enabled: wdOn(), online: botOnline(), games: cfg.rust ? ['cs2', 'rust'] : ['cs2'], maxItems: cfg.skinWdMaxItems, autoMax: cfg.skinWdAuto, dayMax: cfg.skinWdDay, withdrawable: au ? wdWithdrawable(au.id) / 100 : 0 }); }
+    if (url.pathname === '/skin-withdraw/stock' && req.method === 'GET') {
+      const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to withdraw' }); if (!wdOn()) return send(res, 503, { error: 'skin withdrawals are not available' });
+      const game = url.searchParams.get('game') === 'rust' && cfg.rust ? 'rust' : 'cs2'; if (!botOnline()) return send(res, 503, { error: 'withdrawals are unavailable right now, try again in a few minutes' });
+      wdEnsureStock(game); const S = STOCK[game]; if (!S || Date.now() - S.at > 10 * 60e3) return send(res, 200, { status: 'loading' });
+      const P = await skinPrices(game); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
+      const held = wdReserved(game), items = [];
+      for (const i of S.items) { const pr = P.get(i.name); if (!(pr >= 0.03) || pr > cfg.skinWdMaxPrice || held.has(i.assetid)) continue; items.push({ assetid: i.assetid, name: i.name, wear: i.wear, icon: i.icon, cost: wdCostC(pr) / 100 }); }
+      items.sort((a, b) => b.cost - a.cost); return send(res, 200, { status: 'ready', items, withdrawable: wdWithdrawable(au.id) / 100 });
+    }
+    if (url.pathname === '/skin-withdraw/catalog' && req.method === 'GET') {                         // every skin sold on the Steam Market that we can order, found by name
+      const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to withdraw' }); if (!wdOn()) return send(res, 503, { error: 'skin withdrawals are not available' });
+      const game = url.searchParams.get('game') === 'rust' && cfg.rust ? 'rust' : 'cs2', words = String(url.searchParams.get('q') || '').toLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
+      if (words.join('').length < 3) return send(res, 200, { items: [], hint: 'type at least 3 letters' });
+      const P = await skinPrices(game); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
+      const held = wdReserved(game), S = STOCK[game], inStock = new Map(); if (S && Date.now() - S.at < 10 * 60e3) for (const i of S.items) if (!held.has(i.assetid)) inStock.set(i.name, (inStock.get(i.name) || 0) + 1);
+      const out = []; for (const [name, pr] of P) { if (!(pr >= 0.03) || pr > cfg.skinWdMaxPrice) continue; const l = name.toLowerCase(); if (words.every(w => l.includes(w))) out.push({ name, cost: wdCostC(pr) / 100, stock: inStock.get(name) || 0 }); }
+      out.sort((a, b) => (b.stock > 0) - (a.stock > 0) || a.name.length - b.name.length || a.name.localeCompare(b.name)); return send(res, 200, { items: out.slice(0, 40), more: out.length > 40 });
+    }
+    if (url.pathname === '/skin-withdraw/mine' && req.method === 'GET') { const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in' }); return send(res, 200, { items: db.prepare('SELECT * FROM skin_wd WHERE user_id=? ORDER BY created_at DESC LIMIT 10').all(au.id).map(wdPub) }); }
+    if (url.pathname === '/skin-withdraw' && req.method === 'POST') {
+      if (!humanOk(req)) return send(res, 403, { error: 'verification required, reload the page' });
+      const au = authUser(req); if (!au) return send(res, 401, { error: 'sign in to withdraw' }); if (!pubUser(au).verified) return send(res, 403, { error: 'confirm your email address first (check your inbox)' });
+      if (!wdOn()) return send(res, 503, { error: 'skin withdrawals are not available' }); if (limited(ip)) return send(res, 429, { error: 'too many requests' });
+      if (!botOnline()) return send(res, 503, { error: 'withdrawals are unavailable right now, try again in a few minutes' });
+      let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
+      const tu = String(b.tradeUrl || '').trim(); if (!TRADE_URL.test(tu)) return send(res, 400, { error: 'enter your Steam trade URL (https://steamcommunity.com/tradeoffer/new/?partner=...&token=...)' });
+      if (au.steam_id && steamId64(tu) !== String(au.steam_id)) return send(res, 400, { error: 'that trade URL belongs to a different Steam account than the one linked to your account' });
+      const game = b.game === 'rust' && cfg.rust ? 'rust' : 'cs2', ids = [...new Set((Array.isArray(b.assetids) ? b.assetids : []).map(x => String(x)))];
+      const names = [...new Set((Array.isArray(b.names) ? b.names : []).map(x => String(x).slice(0, 120)))];
+      if (!ids.length && !names.length) return send(res, 400, { error: 'choose at least one skin' }); if (ids.length + names.length > cfg.skinWdMaxItems) return send(res, 400, { error: 'at most ' + cfg.skinWdMaxItems + ' skins per withdrawal' }); if (names.length > 5) return send(res, 400, { error: 'you can order at most 5 skins that are not in stock at once' });
+      const S = STOCK[game] || { at: 0, items: [] }; if (ids.length && Date.now() - S.at > 10 * 60e3) return send(res, 409, { error: 'the skin list is out of date, reload it' });
+      const P = await skinPrices(game); if (!P) return send(res, 503, { error: 'skin prices are unavailable right now, try again shortly' });
+      const have = new Map(S.items.map(i => [i.assetid, i])), items = []; let cost = 0;
+      for (const a of ids) { const it = have.get(a), pr = it && P.get(it.name); if (!it || !(pr >= 0.03) || pr > cfg.skinWdMaxPrice) return send(res, 409, { error: 'one of those skins is no longer available, reload the list' }); const c = wdCostC(pr); cost += c; items.push({ assetid: a, name: it.name, price: pr, cost: c / 100 }); }
+      const taken = new Set([...wdReserved(game), ...ids]);
+      for (const n of names) { const pr = P.get(n); if (!(pr >= 0.03) || pr > cfg.skinWdMaxPrice) return send(res, 409, { error: 'that skin is not available for withdrawal: ' + n.slice(0, 60) }); const c = wdCostC(pr), hit = Date.now() - S.at < 10 * 60e3 ? S.items.find(x => x.name === n && !taken.has(x.assetid)) : null; if (hit) taken.add(hit.assetid); cost += c; items.push({ assetid: hit ? hit.assetid : null, name: n, price: pr, cost: c / 100 }); }
+      if (cost > cfg.skinWdDay * 100) return send(res, 400, { error: 'the daily withdrawal limit is ' + cfg.skinWdDay + ' CR' });
+      const id = 'swd_' + crypto.randomBytes(8).toString('hex'); let code; do { code = 'WD-' + crypto.randomBytes(3).toString('hex').slice(0, 4).toUpperCase(); } while (db.prepare('SELECT 1 FROM skin_wd WHERE code=?').get(code));
+      const review = cost > cfg.skinWdAuto * 100, needs = items.some(i => !i.assetid); let fail = '';
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const held = wdReserved(game), open = db.prepare("SELECT COUNT(*) n FROM skin_wd WHERE user_id=? AND status IN ('review','checking','buying','queued','sent','stuck')").get(au.id).n;
+        const day = db.prepare("SELECT COALESCE(SUM(cost_c),0) s FROM skin_wd WHERE user_id=? AND status != 'failed' AND created_at > ?").get(au.id, Date.now() - 864e5).s, u = db.prepare('SELECT bal_c, lock_c FROM users WHERE id=?').get(au.id);
+        if (items.some(i => i.assetid && held.has(i.assetid))) fail = 'one of those skins was just taken, reload the list';
+        else if (open >= 3) fail = 'you already have 3 withdrawals in progress, wait for them to finish';
+        else if (day + cost > cfg.skinWdDay * 100) fail = 'the daily withdrawal limit is ' + cfg.skinWdDay + ' CR';
+        else if (u.lock_c > 0) fail = 'play through the CR you bought once to unlock withdrawals (' + (u.lock_c / 100).toFixed(2) + ' CR left to play)';
+        else if (cost > u.bal_c) fail = 'not enough CR: these skins cost ' + (cost / 100).toFixed(2) + ' CR and you have ' + (u.bal_c / 100).toFixed(2);
+        if (fail) db.exec('ROLLBACK');
+        else {
+          q.credit.run(au.id, -cost / 100, 'skin withdrawal', 'wd:' + id, Date.now()); db.prepare('UPDATE users SET bal_c = bal_c - ? WHERE id=?').run(cost, au.id);
+          const w = { id, user_id: au.id, game, trade_url: tu, items: JSON.stringify(items), cost_c: cost, status: review ? 'review' : needs ? 'checking' : 'queued', code, created_at: Date.now() };
+          db.prepare('INSERT INTO skin_wd (id,user_id,game,trade_url,items,cost_c,status,code,created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(w.id, w.user_id, w.game, w.trade_url, w.items, w.cost_c, w.status, w.code, w.created_at);
+          if (!review) { if (needs) wdMarketJob(w); else wdQueueJob(w); } db.exec('COMMIT');
+        }
+      } catch (e) { try { db.exec('ROLLBACK'); } catch (_) {} throw e; }
+      if (fail) return send(res, 400, { error: fail });
+      log(null, 'skin withdrawal ' + id + ' ' + code + ' ' + (cost / 100) + ' CR ' + items.length + ' skin(s) ' + (review ? 'WAITING FOR APPROVAL' : needs ? 'checking the Steam Market' : 'queued')); return send(res, 200, { id, code, cost: cost / 100, count: items.length, status: review ? 'review' : needs ? 'checking' : 'queued', waiting: items.filter(i => !i.assetid).length });
+    }
     if (req.method === 'GET' && url.pathname === '/skin-deposits/config') return send(res, 200, { enabled: cfg.skins !== 'off', demo: cfg.skins === 'mock', real: cfg.skins === 'bot', online: cfg.skins === 'mock' || (cfg.skins === 'bot' && botOnline()), rate: cfg.skinRate, rates: { cs2: cfg.skinRate, rust: cfg.skinRateRust }, games: cfg.rust ? ['cs2', 'rust'] : ['cs2'], maxItems: cfg.skinMaxItems, min: cfg.min, max: cfg.max, ttlMin: cfg.skinTtlMin, bot: cfg.skinBot, instantMax: cfg.skinInstantMax, holdDays: cfg.skinHoldDays });
     if (cfg.skins === 'bot' && req.method === 'POST' && url.pathname === '/skin-deposits/inventory') {      // step 1: ask our bot to read the player's (public) CS2 inventory
       if (!humanOk(req)) return send(res, 403, { error: 'verification required, reload the page' });
@@ -532,10 +673,22 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { jobs: jobs.map(j => ({ id: j.id, type: j.type, payload: jsonOr(j.payload, {}) })), watch, now: Date.now() });
       }
       if (req.method === 'POST' && (m = url.pathname.match(/^\/bot\/jobs\/([\w-]+)$/))) {
-        let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
+        let b; try { b = JSON.parse(await readBody(req, 800000)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
         const j = db.prepare('SELECT * FROM bot_jobs WHERE id=?').get(m[1]); if (!j) return send(res, 404, { error: 'unknown job' });
         const ok = !!b.ok;
+        if (j.type === 'stock') {                                                                     // our own inventory: keep it in memory, not in the jobs table
+          const pl = jsonOr(j.payload, {}); if (ok && b.result && Array.isArray(b.result.items) && APPS[pl.game]) STOCK[pl.game] = { at: Date.now(), items: b.result.items.slice(0, 600).map(x => ({ assetid: String(x.assetid || '').slice(0, 24), name: String(x.name || '').slice(0, 120), wear: String(x.wear || '').slice(0, 30), icon: String(x.icon || '').slice(0, 300) })).filter(x => x.assetid && x.name) };
+          db.prepare('UPDATE bot_jobs SET status=?, result=?, done_at=? WHERE id=?').run(ok ? 'done' : 'failed', JSON.stringify(ok ? { n: ((b.result || {}).items || []).length } : { error: String(b.error || 'failed').slice(0, 200) }), Date.now(), j.id);
+          wdFulfil(); return send(res, 200, { ok: true });
+        }
         db.prepare('UPDATE bot_jobs SET status=?, result=?, done_at=? WHERE id=?').run(ok ? 'done' : 'failed', JSON.stringify(ok ? (b.result || {}) : { error: String(b.error || 'failed').slice(0, 200) }), Date.now(), j.id);
+        if (j.type === 'market') { const pl = jsonOr(j.payload, {}), w = db.prepare('SELECT * FROM skin_wd WHERE id=?').get(pl.wd);
+          if (ok && w && w.status === 'checking') { const res = new Map(((b.result || {}).items || []).map(x => [String(x.name), !!x.ok])), bad = (pl.names || []).filter(n => res.get(n) !== true);
+            if (bad.length) wdRefund(w.id, 'not sold on the Steam Market: ' + bad.join(', ').slice(0, 100)); else if (db.prepare("UPDATE skin_wd SET status='buying' WHERE id=? AND status='checking'").run(w.id).changes) { log(null, 'withdrawal ' + w.code + ' needs skins we do not have: shown in Skins to buy'); wdFulfil(); } } }
+        if (j.type === 'give') { const pl = jsonOr(j.payload, {});
+          if (ok && b.result && b.result.offerId) { db.prepare("UPDATE skin_wd SET status='sent', offer_id=? WHERE id=? AND status='queued'").run(String(b.result.offerId).replace(/\D/g, '').slice(0, 20), pl.wd); log(null, 'withdrawal ' + pl.code + ' offer ' + b.result.offerId + ' sent'); }
+          else if (!ok) wdRefund(pl.wd, 'could not send the offer: ' + String(b.error || 'failed').slice(0, 120)); }
+
         if (j.type === 'trade') {
           const pl = jsonOr(j.payload, {}), d = q.get.get(pl.depositId);
           if (d) { if (ok && b.result && b.result.offerId) { if (d.status === 'pending') db.prepare("UPDATE deposits SET raw_status=? WHERE id=?").run('sent:' + String(b.result.offerId).replace(/\D/g, '').slice(0, 20), d.id); log(d.id, 'trade offer ' + b.result.offerId + ' sent'); } else if (!ok && d.status === 'pending') { q.upd.run('expired', d.confirmations, null, 'bot: ' + String(b.error || 'failed').slice(0, 80), d.id); log(d.id, 'bot could not send the offer: ' + String(b.error || '').slice(0, 150)); } }
@@ -544,7 +697,9 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === 'POST' && url.pathname === '/bot/offer-event') {
         let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
+        if (/^WD-/.test(String(b.code || ''))) { const r = wdEvent(String(b.code), String(b.state || ''), String(b.offerId || '').replace(/\D/g, '').slice(0, 20)); return r ? send(res, 200, { ok: true, status: r }) : send(res, 404, { error: 'unknown withdrawal code' }); }
         const d = db.prepare("SELECT * FROM deposits WHERE address=? AND provider='skins'").get(String(b.code || '')); if (!d) return send(res, 404, { error: 'unknown trade code' });
+
         const st = String(b.state || ''), oid = String(b.offerId || '').replace(/\D/g, '').slice(0, 20);
         if (st === 'accepted') {
           if (d.status !== 'pending' && d.status !== 'expired') return send(res, 200, { ok: true, status: d.status });   // already handled (the bot may repeat itself)
@@ -662,4 +817,4 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { console.error(e); send(res, 500, { error: e.message || 'server error' }); }
 });
 if (require.main === module) server.listen(cfg.port, () => console.log(`deposit server on :${cfg.port} · provider=${cfg.provider} · min ${cfg.min} max ${cfg.max} CR` + (cfg.allowOrigin === '*' ? ' · WARNING: ALLOWED_ORIGIN not set' : '')));
-module.exports = { server, cfg, db, outbox, releaseHolds };
+module.exports = { server, cfg, db, outbox, releaseHolds, sweep: wdSweep, STOCK };

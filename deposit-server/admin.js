@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions, reverseSkin }) {
+module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions, reverseSkin, WD, wdQueueJob, wdPub, APPS }) {
   db.exec(`CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, action TEXT, target TEXT, detail TEXT, ip TEXT);`);
   try { db.exec('ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
   try { db.exec('ALTER TABLE users ADD COLUMN ban_reason TEXT'); } catch (e) {}
@@ -113,6 +113,21 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
       if (!['held', 'credited'].includes(d.status)) throw new Error('only held or credited skin deposits can be reversed (this one is ' + d.status + ')');
       const st = reverseSkin(d, 'admin'); audit(req, 'skin-reverse', d.id, d.amount_cr + ' CR, user ' + d.user_id); return { ok: true, status: st };
     },
+    skinWds(b) {               // skins players paid for with CR: the ones waiting for you, stuck ones, and history
+      const st = String(b.status || 'open'), where = st === 'all' ? '' : st === 'open' ? "WHERE w.status IN ('review','checking','buying','stuck','queued','sent')" : 'WHERE w.status = ?';
+      const rows = all(`SELECT w.*, u.name, u.email FROM skin_wd w LEFT JOIN users u ON u.id = w.user_id ${where} ORDER BY w.created_at DESC LIMIT 200`, ...(st === 'all' || st === 'open' ? [] : [st]));
+      return { enabled: !!(cfg.skinWd && cfg.skins === 'bot'), auto: cfg.skinWdAuto, day: cfg.skinWdDay, markup: cfg.skinWdMarkup, items: rows.map(w => ({ ...wdPub(w), uid: w.user_id, name: w.name || w.user_id, email: w.email || '', done: w.done_at || null })) };
+    },
+    skinsToBuy() {             // skins players ordered that the bot does not hold: buy them (Steam Market or trade) and the withdrawal is sent by itself
+      const m = new Map();
+      for (const w of all("SELECT * FROM skin_wd WHERE status IN ('checking','buying') ORDER BY created_at")) for (const it of JSON.parse(w.items || '[]')) { if (it.assetid) continue;
+        const k = w.game + '|' + it.name, e = m.get(k) || { game: w.game, name: it.name, qty: 0, value: 0, since: w.created_at, verifying: false, players: new Set(), link: 'https://steamcommunity.com/market/listings/' + APPS[w.game] + '/' + encodeURIComponent(it.name) };
+        e.qty++; e.value += it.price || 0; e.players.add(w.user_id); if (w.status === 'checking') e.verifying = true; m.set(k, e); }
+      return { days: cfg.skinWdBuyDays, items: [...m.values()].map(e => ({ ...e, players: e.players.size, value: Math.round(e.value * 100) / 100 })).sort((x, y) => x.since - y.since) };
+    },
+    skinWdApprove(b, req) { const w = WD.approve(String(b.id || '')); audit(req, 'skin-withdrawal approve', w.id, cr(w.cost_c) + ' CR, user ' + w.user_id); return { ok: true }; },
+    skinWdReject(b, req) { const why = String(b.reason || '').trim().slice(0, 150); if (why.length < 4) throw new Error('write a reason (4+ characters)'); const w = WD.reject(String(b.id || ''), why); audit(req, 'skin-withdrawal refuse', w.id, cr(w.cost_c) + ' CR refunded, user ' + w.user_id + ': ' + why); return { ok: true }; },
+    skinWdSent(b, req) { const w = WD.complete(String(b.id || '')); audit(req, 'skin-withdrawal marked sent', w.id, cr(w.cost_c) + ' CR, user ' + w.user_id); return { ok: true }; },
     rounds(b) {
       const L = lim(b.limit, 50, 200), w = [], a = [];
       if (b.user) { w.push('user_id = ?'); a.push(String(b.user)); } if (b.game) { w.push('game = ?'); a.push(String(b.game)); }
@@ -155,7 +170,7 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
     backupNow(b, req) { const name = makeBackup(); audit(req, 'backup', name, ''); return { ok: true, name }; },
     log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
   };
-  const ROUTES = { deleteUser: API.deleteUser, skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
+  const ROUTES = { skinsToBuy: API.skinsToBuy, skinWds: API.skinWds, skinWdApprove: API.skinWdApprove, skinWdReject: API.skinWdReject, skinWdSent: API.skinWdSent, deleteUser: API.deleteUser, skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
 
   async function route(req, res, url) {
     const P = url.pathname;
@@ -210,7 +225,7 @@ function signout(){TOKEN='';try{sessionStorage.removeItem('cd_admin')}catch(e){}
 $('#out').onclick=signout;
 $('#go').onclick=async()=>{TOKEN=$('#tok').value.trim();$('#lerr').textContent='';try{await api('overview');try{sessionStorage.setItem('cd_admin',TOKEN)}catch(e){}start()}catch(e){$('#lerr').textContent=e.message}};
 $('#tok').addEventListener('keydown',e=>{if(e.key==='Enter')$('#go').click()});
-const TABS=['Overview','Players','Rounds','Deposits','Withdrawals','Sports','Chat','Prices','Backups','Log'];let tab='Overview';
+const TABS=['Overview','Players','Rounds','Deposits','Skins to buy','Skin payouts','Withdrawals','Sports','Chat','Prices','Backups','Log'];let tab='Overview';
 function start(){$('#login').hidden=true;$('#app').hidden=false;const nav=$('#nav');nav.replaceChildren(...TABS.map(t=>E('button',{cls:t===tab?'on':'',on:{click:()=>{tab=t;start()}}},t)));VIEW[tab]().catch(e=>toast(e.message,1))}
 const tbl=(heads,rows,onrow)=>E('div',{cls:'wrap'},E('table',null,E('thead',null,E('tr',null,heads.map(h=>E('th',{cls:h.n?'n':''},h.t||h)))),E('tbody',null,rows.map(r=>{const tr=E('tr',onrow?{cls:'click',on:{click:()=>onrow(r)}}:null,r.cells.map((c,i)=>E('td',{cls:heads[i]&&heads[i].n?'n':''},c)));return tr}))));
 const K=(l,v,c)=>E('div',{cls:'k'},E('small',null,l),E('b',{cls:c||''},v));
@@ -229,6 +244,15 @@ async Rounds(){const u=E('input',{placeholder:'user id (optional)'}),g=E('input'
  run=async()=>{const r=await api('rounds',{user:u.value.trim(),game:g.value.trim(),minPayout:mp.value,limit:100});out.replaceChildren(E('h3',null,'Per game (all time)'),tbl(['Game',{t:'Rounds',n:1},{t:'Wagered',n:1},{t:'Paid',n:1},{t:'RTP %',n:1}],r.games.map(x=>({cells:[x.game,x.rounds,fmt(x.wagered),fmt(x.paid),x.rtp]}))),E('h3',{style:'margin-top:16px'},'Latest rounds'),tbl([{t:'#',n:1},'Player','Game',{t:'Stake',n:1},{t:'Payout',n:1},{t:'x',n:1},'Result','When'],r.rounds.map(x=>({id:x.uid,cells:[x.id,x.name,x.game,fmt(x.stake),fmt(x.payout),x.mult,x.label,dt(x.ts)]})),r=>PLAYER(r.id)))};
  show(E('div',{cls:'row'},u,g,mp,E('button',{cls:'b pri',on:{click:run}},'Filter')),out);await run()},
 async Deposits(){const s=E('select',null,[['','paid, confirming and held'],['held','skins on hold'],['partial','needs review'],['pending','unpaid'],['expired','expired'],['all','everything']].map(x=>E('option',{value:x[0]},x[1]))),out=E('div'),run=async()=>{const r=await api('deposits',{status:s.value,limit:100});out.replaceChildren(tbl(['Player','Coin',{t:'CR',n:1},'Status','Created','Credited'],r.deposits.map(d=>({id:d.user_id,cells:[d.name||d.user_id,d.coin+(d.network?' / '+d.network:''),fmt(d.amount_cr),d.status+(d.status==='held'?' until '+dt(d.hold_until):''),dt(d.created_at),dt(d.credited_at),d.provider==='skins'&&(d.status==='held'||d.status==='credited')?E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();if(!confirm('Reverse this skin deposit? The CR is taken back out of the balance.'))return;try{await api('skinReverse',{id:d.id});run()}catch(x){alert(x.message)}}}},'Reverse'):''] })),r=>PLAYER(r.id)))};s.onchange=run;show(E('div',{cls:'row'},s),out);await run()},
+async ['Skins to buy'](){const out=E('div'),run=async()=>{const r=await api('skinsToBuy',{});
+ out.replaceChildren(E('div',{cls:'grid'},K('Different skins to buy',r.items.length,r.items.length?'y':'g'),K('Pieces to buy',r.items.reduce((n,x)=>n+x.qty,0)),K('Refunded if not in stock after (days)',r.days)),
+ E('p',{cls:'m'},'Players ordered these skins and the bot account does not hold them. Buy each one for the bot account (Steam Market, or trade it to the bot). When it is in the bot inventory and tradable, the withdrawal is sent automatically. The value is the market price players paid for.'),
+ tbl(['Game','Skin',{t:'Qty',n:1},{t:'Value (USD)',n:1},'Players','Waiting since','Status','Steam'],r.items.map(x=>({id:'',cells:[x.game.toUpperCase(),x.name,x.qty,fmt(x.value),x.players,dt(x.since),x.verifying?'checking the Steam Market':'BUY THIS',E('a',{href:x.link,target:'_blank',rel:'noopener'},'Market page')]}))))};show(out);await run();clearInterval(window._stb);window._stb=setInterval(()=>{if(tab==='Skins to buy')run().catch(()=>{})},30000)},
+async ['Skin payouts'](){const s=E('select',null,[['open','needs attention / in progress'],['completed','completed'],['failed','refunded'],['all','everything']].map(x=>E('option',{value:x[0]},x[1]))),out=E('div'),run=async()=>{const r=await api('skinWds',{status:s.value});
+ out.replaceChildren(E('div',{cls:'grid'},K('Skin withdrawals',r.enabled?'ON':'off',r.enabled?'g':'y'),K('Auto-send up to (CR)',r.auto),K('Daily limit (CR)',r.day),K('Price markup','x'+r.markup)),
+ tbl(['Player',{t:'CR',n:1},'Skins','Code','Asked','Status','Action'],r.items.map(w=>({id:w.uid,cells:[w.name,fmt(w.cost),E('span',{title:w.items.join(' | ')},w.count+' '+w.game+': '+w.items.slice(0,2).join(', ')+(w.items.length>2?'…':'')),w.code,dt(w.createdAt),w.status+(w.note?' ('+w.note+')':''),
+  (w.status==='review'||w.status==='checking'||w.status==='buying')?E('span',{cls:'row',style:'margin:0'},(w.status==='review'?E('button',{cls:'b pri',on:{click:async e=>{e.stopPropagation();try{await api('skinWdApprove',{id:w.id});toast('Approved, the offer is being sent');run()}catch(z){toast(z.message,1)}}}},'Approve'):''),E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();const why=prompt('Reason (the CR is refunded):');if(!why)return;try{await api('skinWdReject',{id:w.id,reason:why});toast('Refused and refunded');run()}catch(z){toast(z.message,1)}}}},'Refuse'))
+  :w.status==='stuck'?E('span',{cls:'row',style:'margin:0'},E('button',{cls:'b pri',on:{click:async e=>{e.stopPropagation();if(!confirm('Only do this if you checked on Steam that the offer was accepted.'))return;try{await api('skinWdSent',{id:w.id});run()}catch(z){toast(z.message,1)}}}},'Mark sent'),E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();const why=prompt('Reason (the CR is refunded). Only if the skins did NOT arrive:');if(!why)return;try{await api('skinWdReject',{id:w.id,reason:why});run()}catch(z){toast(z.message,1)}}}},'Refund')):''] })),r=>PLAYER(r.id)))};s.onchange=run;show(E('div',{cls:'row'},s),out);await run()},
 async Withdrawals(){const filt=E('select',null,[['pending','waiting to be paid'],['paid','paid'],['rejected','rejected'],['all','everything']].map(x=>E('option',{value:x[0]},x[1]))),out=E('div'),run=async()=>{const r=await api('withdrawals',{status:filt.value});
  out.replaceChildren(E('div',{cls:'grid'},K('Withdrawals',r.enabled?'ON':'off (set WITHDRAWALS=on)',r.enabled?'g':'y'),K('Waiting to be paid',r.pending.n,r.pending.n?'y':'g'),K('Waiting amount (CR)',fmt(r.pending.amount))),
  tbl(['Player',{t:'CR',n:1},'SOL address','Asked','Status',{t:'Deposited',n:1},{t:'Withdrawn',n:1},'Action'],r.items.map(w=>{const f=E('input',{placeholder:w.status==='pending'?'tx link, or reason to reject':'',size:22,value:w.txid||w.note||''});if(w.status!=='pending')f.disabled=true;

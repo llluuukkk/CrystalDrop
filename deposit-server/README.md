@@ -120,7 +120,7 @@ Web service variables (on top of the existing ones):
 | `SKIN_INSTANT_MAX` | `100` | CR a player can receive instantly per hold window. Above it the deposit is held. `0` holds everything. |
 | `SKIN_HOLD_DAYS` | `7` | Hold length. `0` credits everything instantly (not recommended). |
 | `SKIN_RATE` | `0.9` | CR per $1 of CS2 market value. |
-| `SKIN_RATE_RUST` | `0.8` | CR per $1 of Rust market value (Rust skins trade thinner, so the default is lower). |
+| `SKIN_RATE_RUST` | `0.995` | CR per $1 of Rust market value. |
 | `SKIN_RUST` | on | Set to `0` to switch Rust deposits off. |
 
 Worker (Render > New > Background Worker, same repo, root directory `deposit-server`, build command `npm install`, start command `node bot.js`):
@@ -146,3 +146,14 @@ What is and is not verified:
 - A player who gets hijacked-account trades reversed after the hold is still your loss if the CR was already spent. The hold and the per-player instant limit only shrink that risk.
 
 Rust skins use the same bot and the same flow (Steam app 252490). Prices come from Skinport's Rust list. Check on the first real Rust deposit that Skinport returns prices for your items, and that the bot account can see Rust inventories (they must be public).
+
+## Skin withdrawals (skins only)
+
+Players can turn CR into skins from the bot's own Steam inventory (Wallet → "Withdraw skins"). Nothing else can be withdrawn.
+
+- Needs the Steam bot worker (see "Your own Steam trade bot"). The bot's inventory is the stock: skins it received from deposits and anything you put there yourself. Only items that are tradable right now are listed (Steam keeps new items locked for a few days).
+- Price = Skinport market price x `SKIN_WD_MARKUP` (default 1.02). The CR are taken when the player confirms and refunded automatically if the offer is declined, cancelled, expired or cannot be sent.
+- Rules: CR bought with crypto/skins must be played through once first (`lock_c`), at most 3 open withdrawals, `SKIN_WD_DAY` CR per 24 h (default 1000), `SKIN_WD_MAX_ITEMS` per withdrawal (default 10). If the player's account has a linked Steam id, the trade URL must be that account.
+- Withdrawals above `SKIN_WD_AUTO` CR (default 300) wait for you: admin panel → "Skin payouts" → Approve or Refuse (refusing refunds the CR). A withdrawal with no answer from Steam for 3 h shows as "stuck": check Steam, then "Mark sent" or "Refund".
+- `SKIN_WD=0` switches it off. The bot needs no new variables, only the latest `bot.js` (it adds the `stock` and `give` jobs); the Steam mobile confirmation is done by the identity secret.
+- Skins worth more than `SKIN_WD_MAX_PRICE` USD (default 5000) are never offered. Skins that are not in stock can be ordered: the bot checks the Steam Market, the order shows in admin → "Skins to buy", and the withdrawal is sent by itself once the skin is in the bot inventory (refunded after `SKIN_WD_BUY_DAYS`, default 10).

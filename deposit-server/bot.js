@@ -3,6 +3,7 @@
 //   node bot.js
 // It logs in to the bot's Steam account, then polls the website server (GET /bot/jobs):
 //   inventory job -> reads a player's public CS2 inventory      trade job -> sends the player a trade offer asking for their skins
+//   stock job -> reads OUR inventory (what can be withdrawn)     give job -> sends a player the skins they paid for with CR (a withdrawal)
 // and reports every offer change (accepted / declined / cancelled / rolled back) to POST /bot/offer-event. The server does ALL pricing and crediting;
 // this process never decides how much a skin is worth and never holds any player balance.
 //
@@ -38,6 +39,10 @@ function createBot({ api, token, adapter, pollMs = 3000, watchMs = 10 * 60e3, lo
     try {
       if (j.type === 'inventory') { const items = await adapter.inventory(j.payload.steamid, j.payload.appid || 730); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { items } }); log('inventory', j.payload.steamid, items.length, 'items'); }
       else if (j.type === 'trade') { const p = j.payload, r = await adapter.sendOffer({ appid: p.appid || 730, steamid: p.steamid, tradeUrl: p.tradeUrl, assetids: p.assetids, message: p.message, code: p.code }); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { offerId: String(r.offerId) } }); log('offer', r.offerId, p.code, p.assetids.length, 'items'); }
+      else if (j.type === 'stock') { const items = await adapter.stock(j.payload.appid || 730); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { items } }); log('stock', j.payload.appid, items.length, 'items'); }
+      else if (j.type === 'market') { const out = []; for (const n of (j.payload.names || []).slice(0, 8)) { out.push({ name: n, ok: await adapter.onMarket(j.payload.appid || 730, n) }); await new Promise(r => setTimeout(r, pollMs > 1000 ? 3100 : 0)); }   // Steam limits market lookups: one every ~3 s
+        await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { items: out } }); log('market check', out.map(x => x.name + '=' + x.ok).join(', ')); }
+      else if (j.type === 'give') { const p = j.payload, r = await adapter.sendGift({ appid: p.appid || 730, steamid: p.steamid, tradeUrl: p.tradeUrl, assetids: p.assetids, message: p.message, code: p.code }); await call('POST', '/bot/jobs/' + j.id, { ok: true, result: { offerId: String(r.offerId) } }); log('withdrawal offer', r.offerId, p.code); }
       else await call('POST', '/bot/jobs/' + j.id, { ok: false, error: 'unknown job type' });
     } catch (e) { log('job failed', j.type, e && e.message); try { await call('POST', '/bot/jobs/' + j.id, { ok: false, error: friendly(e) }); } catch (_) {} }
   }
@@ -77,8 +82,8 @@ function steamAdapter(env = process.env) {
   client.on('steamGuard', (domain, cb) => { console.error('steam: asked for a Steam Guard code by email — this bot must use the mobile authenticator (shared_secret)'); cb(SteamTotp.generateAuthCode(env.STEAM_SHARED_SECRET)); });
   setInterval(() => { if (client.steamID && !ready) client.webLogOn(); }, 5 * 60e3).unref();
   manager.on('sentOfferChanged', (offer, old) => {
-    const st = name[offer.state] || 'unknown', m = /CD-[A-Z0-9]{4}/.exec(offer.message || ''); if (!m || st === 'unknown') { if (m) console.log('offer', offer.id, 'state', offer.state, 'ignored'); return; }
-    if (st !== 'accepted') return emit({ code: m[0], offerId: offer.id, state: st });
+    const st = name[offer.state] || 'unknown', m = /(?:CD|WD)-[A-Z0-9]{4}/.exec(offer.message || ''); if (!m || st === 'unknown') { if (m) console.log('offer', offer.id, 'state', offer.state, 'ignored'); return; }
+    if (st !== 'accepted' || /^WD-/.test(m[0])) return emit({ code: m[0], offerId: offer.id, state: st });                     // a withdrawal has no received items to read
     offer.getReceivedItems((err, items) => { if (err) { console.error('getReceivedItems', offer.id, err.message); return; } emit({ code: m[0], offerId: offer.id, state: 'accepted', items: items.map(i => ({ assetid: String(i.assetid || i.id), name: i.market_hash_name })) }); });
   });
   if (env.STEAM_BOT_USER) login();
@@ -86,6 +91,13 @@ function steamAdapter(env = process.env) {
   return {
     ready: () => ready, onOffer: f => subs.push(f),
     inventory: (steamid, appid = 730) => new Promise((res, rej) => manager.getUserInventoryContents(steamid, appid, 2, true, (e, inv) => e ? rej(e) : res(inv.filter(i => i.tradable && i.marketable).map(i => ({ assetid: String(i.assetid || i.id), name: i.market_hash_name, wear: wear(i), icon: i.icon_url || '' }))))),
+    onMarket: (appid, name) => new Promise((res, rej) => community.getMarketItem(appid, name, 1, (e, item) => {          // is this skin sold on the Steam Market? (a rate limit or network problem is an error, so the check is retried)
+      if (e) return /rate|429|too many|timeout|timed out|ECONN|ETIMEDOUT|50\d|busy|try again/i.test(String(e.message || e)) ? rej(e) : res(false); res(!!item); })),
+    stock: (appid = 730) => new Promise((res, rej) => manager.getInventoryContents(appid, 2, true, (e, inv) => e ? rej(e) : res(inv.filter(i => i.tradable && i.marketable).slice(0, 600).map(i => ({ assetid: String(i.assetid || i.id), name: i.market_hash_name, wear: wear(i), icon: i.icon_url || '' }))))),
+    sendGift: ({ tradeUrl, assetids, message, appid = 730 }) => new Promise((res, rej) => {                       // we GIVE skins: the Steam app confirmation is done by the confirmation checker (identity secret)
+      const offer = manager.createOffer(tradeUrl); offer.addMyItems(assetids.map(a => ({ appid, contextid: '2', assetid: String(a) }))); offer.setMessage(message);
+      offer.send((e, status) => e ? rej(e) : res({ offerId: offer.id, status }));
+    }),
     sendOffer: ({ tradeUrl, assetids, message, appid = 730 }) => new Promise((res, rej) => {
       const offer = manager.createOffer(tradeUrl); offer.addTheirItems(assetids.map(a => ({ appid, contextid: '2', assetid: String(a) }))); offer.setMessage(message);
       offer.send((e, status) => e ? rej(e) : res({ offerId: offer.id, status }));
