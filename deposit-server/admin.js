@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSessions, reverseSkin, WD, wdQueueJob, wdPub, APPS }) {
+module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, POKER, killSessions, reverseSkin, WD, wdQueueJob, wdPub, APPS }) {
   db.exec(`CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, action TEXT, target TEXT, detail TEXT, ip TEXT);`);
   try { db.exec('ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0'); } catch (e) {}
   try { db.exec('ALTER TABLE users ADD COLUMN ban_reason TEXT'); } catch (e) {}
@@ -145,6 +145,7 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
       const items = PLAY.catalog(), moved = items.filter(x => x.price !== x.base).length, q = String(b.q || '').toLowerCase();
       return { status: PLAY.priceStatus(), total: items.length, moved, items: items.filter(x => !q || x.name.toLowerCase().includes(q)).slice(0, 60) };
     },
+    poker() { return POKER ? POKER.admin.overview() : { on: false, tables: [] }; },
     async pricesRefresh(b, req) { await PLAY.refreshPrices(); audit(req, 'price refresh', '', ''); return { status: PLAY.priceStatus() }; },
     sports(b) { return { status: SPORTS.admin.status(), summary: SPORTS.admin.summary(), events: SPORTS.admin.events(b.filter) }; },
     async sportsSync(b, req) { await SPORTS.admin.sync(); audit(req, 'sports sync', '', ''); return { status: SPORTS.admin.status() }; },
@@ -170,7 +171,7 @@ module.exports = function init({ db, cfg, send, readBody, PLAY, SPORTS, killSess
     backupNow(b, req) { const name = makeBackup(); audit(req, 'backup', name, ''); return { ok: true, name }; },
     log(b) { return { log: all('SELECT ts, action, target, detail, ip FROM admin_log ORDER BY id DESC LIMIT ?', lim(b.limit, 100, 300)) }; },
   };
-  const ROUTES = { skinsToBuy: API.skinsToBuy, skinWds: API.skinWds, skinWdApprove: API.skinWdApprove, skinWdReject: API.skinWdReject, skinWdSent: API.skinWdSent, deleteUser: API.deleteUser, skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
+  const ROUTES = { poker: API.poker, skinsToBuy: API.skinsToBuy, skinWds: API.skinWds, skinWdApprove: API.skinWdApprove, skinWdReject: API.skinWdReject, skinWdSent: API.skinWdSent, deleteUser: API.deleteUser, skinReverse: API.skinReverse, overview: API.overview, backups: API.backups, 'backups/now': API.backupNow, users: API.users, user: API.user, ban: API.ban, mute: API.mute, adjust: API.adjust, rounds: API.rounds, deposits: API.deposits, withdrawals: API.withdrawals, 'withdrawals/paid': API.withdrawPaid, 'withdrawals/reject': API.withdrawReject, chat: API.chat, 'chat/delete': API.chatDelete, prices: API.prices, sports: API.sports, 'sports/sync': API.sportsSync, 'sports/settle': API.sportsSettle, 'sports/void': API.sportsVoid, 'prices/refresh': API.pricesRefresh, log: API.log };
 
   async function route(req, res, url) {
     const P = url.pathname;
@@ -225,7 +226,7 @@ function signout(){TOKEN='';try{sessionStorage.removeItem('cd_admin')}catch(e){}
 $('#out').onclick=signout;
 $('#go').onclick=async()=>{TOKEN=$('#tok').value.trim();$('#lerr').textContent='';try{await api('overview');try{sessionStorage.setItem('cd_admin',TOKEN)}catch(e){}start()}catch(e){$('#lerr').textContent=e.message}};
 $('#tok').addEventListener('keydown',e=>{if(e.key==='Enter')$('#go').click()});
-const TABS=['Overview','Players','Rounds','Deposits','Skins to buy','Skin payouts','Withdrawals','Sports','Chat','Prices','Backups','Log'];let tab='Overview';
+const TABS=['Overview','Players','Rounds','Deposits','Skins to buy','Skin payouts','Withdrawals','Sports','Poker','Chat','Prices','Backups','Log'];let tab='Overview';
 function start(){$('#login').hidden=true;$('#app').hidden=false;const nav=$('#nav');nav.replaceChildren(...TABS.map(t=>E('button',{cls:t===tab?'on':'',on:{click:()=>{tab=t;start()}}},t)));VIEW[tab]().catch(e=>toast(e.message,1))}
 const tbl=(heads,rows,onrow)=>E('div',{cls:'wrap'},E('table',null,E('thead',null,E('tr',null,heads.map(h=>E('th',{cls:h.n?'n':''},h.t||h)))),E('tbody',null,rows.map(r=>{const tr=E('tr',onrow?{cls:'click',on:{click:()=>onrow(r)}}:null,r.cells.map((c,i)=>E('td',{cls:heads[i]&&heads[i].n?'n':''},c)));return tr}))));
 const K=(l,v,c)=>E('div',{cls:'k'},E('small',null,l),E('b',{cls:c||''},v));
@@ -267,6 +268,7 @@ async Sports(){const filt=E('select',null,E('option',{value:''},'All matches'),E
   return {cells:[e.home+' v '+e.away+(e.league?' ('+e.league+')':''),e.sport,dt(e.start),e.status+(e.manual?' (manual)':''),e.openLegs,fmt(e.exposure),E('span',{cls:'row',style:'margin:0'},h,a,E('button',{cls:'b pri',on:{click:async()=>{try{const x=await api('sports/settle',{id:e.id,hs:h.value,as:a.value});toast('Settled, '+x.bets+' bets resolved');run()}catch(z){toast(z.message,1)}}}},'Settle'),E('button',{cls:'b red',on:{click:async()=>{try{const x=await api('sports/void',{id:e.id});toast('Voided, '+x.bets+' bets refunded');run()}catch(z){toast(z.message,1)}}}},'Void'))]}})))};
  filt.onchange=run;show(E('div',{cls:'row'},filt,E('button',{cls:'b pri',on:{click:async e=>{e.target.disabled=true;try{await api('sports/sync');toast('Synced')}catch(x){toast(x.message,1)}e.target.disabled=false;run()}}},'Sync now'),E('span',{cls:'m'},'Settle uses the final score (90 minutes for soccer, maps won for CS2). Void refunds every open bet on the match.')),out);await run()},
 async Chat(){const r=await api('chat',{limit:100});show(tbl(['Player','Message','When',''],r.chat.map(m=>({cells:[m.name,m.text,dt(m.ts),E('button',{cls:'b red',on:{click:async e=>{e.stopPropagation();await api('chat/delete',{id:m.id});toast('Deleted');VIEW.Chat()}}},'Delete')]}))))},
+async Poker(){const r=await api('poker',{});show(E('div',{cls:'grid'},K('Poker',r.on?'on':'off',r.on?'g':'r'),K('Rake taken (all time)',fmt(r.rake)),K('Rake last 24h',fmt(r.rake24h)),K('Hands played',r.hands),K('Hands last 24h',r.hands24h),K('Total pots',fmt(r.potTotal))),tbl(['Table','Stakes',{t:'Seated',n:1},'Hand','Players'],r.tables.map(t=>({cells:[t.id,t.stake,t.seated+' / 6',t.live?'hand '+t.hand+' in progress':'waiting',t.players.map(p=>p.name+' '+fmt(p.stack)+(p.sitOut?' (away)':'')).join(' | ')||'empty']}))))},
 async Prices(){const q=E('input',{placeholder:'search skin'}),out=E('div'),run=async()=>{const r=await api('prices',{q:q.value});const s=r.status;out.replaceChildren(E('div',{cls:'grid'},K('Last refresh',s.updated?dt(s.updated):'never',s.updated?'g':'y'),K('Skins priced live',s.live+' / '+r.total),K('Prices moved from base',r.moved),K('Last error',s.err||'none',s.err?'r':'g')),
   tbl(['Skin',{t:'Base',n:1},{t:'Now',n:1},{t:'Change',n:1}],r.items.map(x=>({cells:[x.name,fmt(x.base),fmt(x.price),((x.price/x.base-1)*100).toFixed(1)+'%']}))))};
  q.addEventListener('keydown',e=>{if(e.key==='Enter')run()});show(E('div',{cls:'row'},q,E('button',{cls:'b',on:{click:run}},'Search'),E('button',{cls:'b pri',on:{click:async e=>{e.target.disabled=true;try{await api('prices/refresh');toast('Prices refreshed')}catch(x){toast(x.message,1)}e.target.disabled=false;run()}}},'Refresh prices now')),out);await run()},

@@ -377,13 +377,15 @@ const pub = d => ({ open: !!d.open, id: d.id, status: d.status, confirmations: d
 
 const PLAY = require('./play.js')({ db, send, readBody, authUser, cfg });
 const SPORTS = require('./sports.js')({ db, send, readBody, authUser, cfg, PLAY });
-const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, SPORTS, killSessions: uid => ET.killSess.run(uid), reverseSkin, WD, wdQueueJob, wdPub, APPS });
+const POKER = require('./poker.js')({ db, send, readBody, authUser, cfg, PLAY });
+const ADMIN = require('./admin.js')({ db, cfg, send, readBody, PLAY, SPORTS, POKER, killSessions: uid => ET.killSess.run(uid), reverseSkin, WD, wdQueueJob, wdPub, APPS });
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), ip = req.socket.remoteAddress;
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (await ADMIN.route(req, res, url)) return;
     if (await SPORTS.route(req, res, url)) return;
+    if (await POKER.route(req, res, url)) return;
     if (await PLAY.route(req, res, url)) return;
     if (req.method === 'POST' && url.pathname === '/captcha/verify') {      // Cloudflare Turnstile check (set TURNSTILE_SECRET)
       let b; try { b = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'bad json' }); }
@@ -817,4 +819,4 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { console.error(e); send(res, 500, { error: e.message || 'server error' }); }
 });
 if (require.main === module) server.listen(cfg.port, () => console.log(`deposit server on :${cfg.port} · provider=${cfg.provider} · min ${cfg.min} max ${cfg.max} CR` + (cfg.allowOrigin === '*' ? ' · WARNING: ALLOWED_ORIGIN not set' : '')));
-module.exports = { server, cfg, db, outbox, releaseHolds, sweep: wdSweep, STOCK };
+module.exports = { server, cfg, db, outbox, releaseHolds, sweep: wdSweep, STOCK, POKER };

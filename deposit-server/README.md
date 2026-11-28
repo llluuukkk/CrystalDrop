@@ -86,6 +86,15 @@ Pre-match betting, singles and combos, markets: match result (1X2 for soccer, wi
 The Odds API free plan is 500 credits a month, so the server refreshes every `SPORTS_SYNC_MIN` minutes (default 360) for the leagues in `SPORTS_LEAGUES` (default `soccer_epl,soccer_spain_la_liga,soccer_uefa_champs_league`). Each league refresh costs 1 credit per market (`SPORTS_MARKETS`, default `h2h,totals`). Results use a scores call (2 credits) at most every `SPORTS_SCORES_MIN` minutes (default 180), and only while a bet is waiting for a result.
 
 
+## Poker (no-limit Texas Hold'em, real players)
+Off by default. Set `POKER=on` in Render's Environment to enable it.
+- 6-seat cash tables, blinds 0.10/0.20, 1/2 and 5/10 CR, buy-in 40 to 100 big blinds. Chips come from the player's playing balance (`pool_c`) and go back when they leave.
+- Rake: `POKER_RAKE` (default 0.05 = 5% of the pot, max 0.10), capped at `POKER_RAKE_CAP_BB` big blinds (default 3). Only taken when a flop is dealt. Totals are in the admin "Poker" tab.
+- Other settings: `POKER_TURN_MS` (25000), `POKER_GAP_MS` (4000), `POKER_RATE` (requests per second per user).
+- Players with CR still to play through (`lock_c` > 0) cannot sit down (stops chip-dumping used to launder bought CR). Two players on the same IP cannot share a table.
+- If the server restarts, every seat is refunded from the last hand end. Render free instances that sleep will trigger this.
+- Not provably fair (server shuffle with crypto.randomInt). Collusion, bots and chip-dumping are real risks with real money; watch the admin tab and the `poker_hands` / `poker_log` tables.
+
 ## Keeping the database safe (do this on Render)
 
 The whole site (balances, rounds, withdrawals, users) lives in one SQLite file. On Render the app folder is wiped on every deploy and restart, so the file must sit on a **persistent disk**:
